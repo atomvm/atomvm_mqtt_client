@@ -1,0 +1,5 @@
+_build/**
+examples/mqtt_example/rebar.lock
+examples/mqtt_example/_build/**
+examples/mqtt_example/_checkouts/**
+rebar.lock

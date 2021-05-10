@@ -1,0 +1,3 @@
+COMPONENT_ADD_INCLUDEDIRS := ports/include
+COMPONENT_SRCDIRS := ports
+CXXFLAGS += -fno-rtti
