@@ -27,6 +27,7 @@
 #include <mailbox.h>
 #include <module.h>
 #include <port.h>
+#include <scheduler.h>
 #include <term.h>
 #include <utils.h>
 
@@ -39,26 +40,48 @@
 
 #define TAG "atomvm_mqtt"
 
-static const char *const mqtt_atom = "\x4" "mqtt";
-static const char *const receiver_atom = "\x8" "receiver";
-static const char *const url = "\x3" "url";
-static const char *const connected_atom = "\x9" "connected";
-static const char *const disconnected_atom = "\xC" "disconnected";
-static const char *const published_atom = "\x9" "published";
-static const char *const subscribed_atom = "\xA" "subscribed";
-static const char *const unsubscribed_atom = "\xC" "unsubscribed";
-static const char *const data_atom = "\x4" "data";
-static const char *const publish_atom = "\x7" "publish";
-static const char *const subscribe_atom = "\x9" "subscribe";
-static const char *const unsubscribe_atom = "\xB" "unsubscribe";
+static const char *const mqtt_atom =            "\x4" "mqtt";
+static const char *const stop_atom =            "\x4" "stop";
+static const char *const receiver_atom =        "\x8" "receiver";
+static const char *const url =                  "\x3" "url";
+static const char *const connected_atom =       "\x9" "connected";
+static const char *const disconnected_atom =    "\xC" "disconnected";
+static const char *const disconnect_atom =      "\xA" "disconnect";
+static const char *const reconnect_atom =       "\x9" "reconnect";
+static const char *const published_atom =       "\x9" "published";
+static const char *const subscribed_atom =      "\xA" "subscribed";
+static const char *const unsubscribed_atom =    "\xC" "unsubscribed";
+static const char *const data_atom =            "\x4" "data";
+static const char *const publish_atom =         "\x7" "publish";
+static const char *const subscribe_atom =       "\x9" "subscribe";
+static const char *const unsubscribe_atom =     "\xB" "unsubscribe";
+
+// error codes
+static const char *const esp_tls_atom =                 "\x07" "esp_tls";
+static const char *const connection_refused_atom =      "\x12" "connection_refused";
+static const char *const connection_accepted_atom =     "\x13" "connection_accepted";
+static const char *const protocol_atom =                "\x08" "protocol";
+static const char *const id_rejected_atom =             "\x0B" "id_rejected";
+static const char *const server_unavailable_atom =      "\x12" "server_unavailable";
+static const char *const bad_username_atom =            "\x0C" "bad_username";
+static const char *const not_authorized_atom =          "\x0E" "not_authorized";
+//                                                             0123456789ABCDEF0123456789ABCDEF
+//                                                             0               1
+
 
 static void consume_mailbox(Context *ctx);
 static term do_publish(Context *ctx, term topic, term data, term qos, term retain);
 static term do_subscribe(Context *ctx, term topic, term qos);
 static term do_unsubscribe(Context *ctx, term topic);
+static void do_stop(Context *ctx);
+static term do_disconnect(Context *ctx);
+static term do_reconnect(Context *ctx);
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event);
 static term make_atom(GlobalContext *global, const char *string);
+static term error_type_to_atom(Context *ctx, esp_mqtt_error_type_t error_type);
+static term connect_return_code_to_atom(Context *ctx, esp_mqtt_connect_return_code_t connect_return_code);
 static term create_tuple4(Context *ctx, term a, term b, term c, term d);
+static term create_tuple5(Context *ctx, term a, term b, term c, term d, term e);
 
 struct platform_data {
     esp_mqtt_client_handle_t client;
@@ -67,9 +90,7 @@ struct platform_data {
 
 void atomvm_mqtt_driver_init(GlobalContext *global)
 {
-    // no-op
     esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
-
 }
 
 Context *atomvm_mqtt_driver_create_port(GlobalContext *global, term opts)
@@ -128,28 +149,36 @@ static void consume_mailbox(Context *ctx)
     uint64_t ref_ticks = term_to_ref_ticks(ref);
     term req = term_get_tuple_element(msg, 2);
 
-    term cmd = term_get_tuple_element(req, 0);
-
     int local_process_id = term_to_local_process_id(pid);
     Context *target = globalcontext_get_process(ctx->global, local_process_id);
 
-    term ret;
-    if (cmd == context_make_atom(ctx, publish_atom)) {
-        term topic = term_get_tuple_element(req, 1);
-        term data = term_get_tuple_element(req, 2);
-        term qos = term_get_tuple_element(req, 3);
-        term retain = term_get_tuple_element(req, 4);
-        ret = do_publish(ctx, topic, data, qos, retain);
-    } else if (cmd == context_make_atom(ctx, subscribe_atom)) {
-        term topic = term_get_tuple_element(req, 1);
-        term qos = term_get_tuple_element(req, 2);
-        ret = do_subscribe(ctx, topic, qos);
-    } else if (cmd == context_make_atom(ctx, unsubscribe_atom)) {
-        term topic = term_get_tuple_element(req, 1);
-        ret = do_unsubscribe(ctx, topic);
-    } else {
-        ESP_LOGE(TAG, "Error: unrecognized command: 0x%x\n", cmd);
-        ret = ERROR_ATOM;
+    term ret = ERROR_ATOM;
+    if (term_is_atom(req)) {
+        if (req == context_make_atom(ctx, stop_atom)) {
+            do_stop(ctx);
+            return;
+        } else if (req == context_make_atom(ctx, disconnect_atom)) {
+            ret = do_disconnect(ctx);
+        } else if (req == context_make_atom(ctx, reconnect_atom)) {
+            ret = do_reconnect(ctx);
+        }
+    }
+    else if (term_is_tuple(req)) {
+        term cmd = term_get_tuple_element(req, 0);
+        if (cmd == context_make_atom(ctx, publish_atom)) {
+            term topic = term_get_tuple_element(req, 1);
+            term data = term_get_tuple_element(req, 2);
+            term qos = term_get_tuple_element(req, 3);
+            term retain = term_get_tuple_element(req, 4);
+            ret = do_publish(ctx, topic, data, qos, retain);
+        } else if (cmd == context_make_atom(ctx, subscribe_atom)) {
+            term topic = term_get_tuple_element(req, 1);
+            term qos = term_get_tuple_element(req, 2);
+            ret = do_subscribe(ctx, topic, qos);
+        } else if (cmd == context_make_atom(ctx, unsubscribe_atom)) {
+            term topic = term_get_tuple_element(req, 1);
+            ret = do_unsubscribe(ctx, topic);
+        }
     }
 
     mailbox_destroy_message(message);
@@ -249,6 +278,53 @@ static term do_unsubscribe(Context *ctx, term topic)
 }
 
 
+static void do_stop(Context *ctx)
+{
+    struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
+    esp_mqtt_client_handle_t client = plfdat->client;
+
+    TRACE(TAG ": do_stop\n");
+    esp_mqtt_client_stop(client);
+    esp_mqtt_client_destroy(client);
+    scheduler_terminate(ctx);
+    free(plfdat);
+}
+
+
+static term do_disconnect(Context *ctx)
+{
+    struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
+    esp_mqtt_client_handle_t client = plfdat->client;
+
+    TRACE(TAG ": do_disconnect\n");
+    esp_err_t status = esp_mqtt_client_disconnect(client);
+
+    if (status == ESP_OK) {
+        ESP_LOGE(TAG, "Error: unable to disconnect from MQTT Broker.\n");
+        return ERROR_ATOM;
+    }
+
+    return OK_ATOM;
+}
+
+
+static term do_reconnect(Context *ctx)
+{
+    struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
+    esp_mqtt_client_handle_t client = plfdat->client;
+
+    TRACE(TAG ": do_reconnect\n");
+    esp_err_t status = esp_mqtt_client_reconnect(client);
+
+    if (status == ESP_OK) {
+        ESP_LOGE(TAG, "Error: unable to reconnect to MQTT Broker.\n");
+        return ERROR_ATOM;
+    }
+
+    return OK_ATOM;
+}
+
+
 static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
 {
     Context *ctx = (Context *) event->user_context;
@@ -285,12 +361,10 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
         }
         case MQTT_EVENT_SUBSCRIBED: {
             TRACE(TAG ": MQTT_EVENT_SUBSCRIBED, msg_id=%d\n", event->msg_id);
-            // int topic_size = term_binary_data_size_in_terms(event->topic_len);
             if (UNLIKELY(memory_ensure_free(ctx, 4) != MEMORY_GC_OK)) {
                 mailbox_send(target, MEMORY_ATOM);
                 return ESP_OK;
             }
-            // term topic = term_from_literal_binary(event->topic, event->topic_len, ctx);
             term msg = port_create_tuple3(ctx,
                 context_make_atom(ctx, mqtt_atom),
                 context_make_atom(ctx, subscribed_atom),
@@ -301,12 +375,10 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
         }
         case MQTT_EVENT_UNSUBSCRIBED: {
             TRACE(TAG ": MQTT_EVENT_UNSUBSCRIBED, msg_id=%d\n", event->msg_id);
-            // int topic_size = term_binary_data_size_in_terms(event->topic_len);
             if (UNLIKELY(memory_ensure_free(ctx, 4) != MEMORY_GC_OK)) {
                 mailbox_send(target, MEMORY_ATOM);
                 return ESP_OK;
             }
-            // term topic = term_from_literal_binary(event->topic, event->topic_len, ctx);
             term msg = port_create_tuple3(ctx,
                 context_make_atom(ctx, mqtt_atom),
                 context_make_atom(ctx, unsubscribed_atom),
@@ -317,12 +389,10 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
         }
         case MQTT_EVENT_PUBLISHED: {
             TRACE(TAG ": MQTT_EVENT_PUBLISHED, msg_id=%d\n", event->msg_id);
-            // int topic_size = term_binary_data_size_in_terms(event->topic_len);
             if (UNLIKELY(memory_ensure_free(ctx, 4) != MEMORY_GC_OK)) {
                 mailbox_send(target, MEMORY_ATOM);
                 return ESP_OK;
             }
-            // term topic = term_from_literal_binary(event->topic, event->topic_len, ctx);
             term msg = port_create_tuple3(ctx,
                 context_make_atom(ctx, mqtt_atom),
                 context_make_atom(ctx, published_atom),
@@ -353,14 +423,22 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
         }
         case MQTT_EVENT_ERROR: {
             ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
-            if (UNLIKELY(memory_ensure_free(ctx, 3) != MEMORY_GC_OK)) {
+            if (UNLIKELY(memory_ensure_free(ctx, 3 + 6) != MEMORY_GC_OK)) {
                 mailbox_send(target, MEMORY_ATOM);
                 return ESP_OK;
             }
-            term msg = port_create_tuple2(
-                ctx,
+            esp_mqtt_error_codes_t *mqtt_error = event->error_handle;
+            term error = create_tuple5(ctx,
+                error_type_to_atom(ctx, mqtt_error->error_type),
+                connect_return_code_to_atom(ctx, mqtt_error->connect_return_code),
+                term_from_int(mqtt_error->esp_tls_last_esp_err),
+                term_from_int(mqtt_error->esp_tls_stack_err),
+                term_from_int(mqtt_error->esp_tls_cert_verify_flags)
+            );
+            term msg = port_create_tuple3(ctx,
                 context_make_atom(ctx, mqtt_atom),
-                ERROR_ATOM
+                ERROR_ATOM,
+                error
             );
             mailbox_send(target, msg);
             break;
@@ -374,6 +452,40 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
             break;
     }
     return ESP_OK;
+}
+
+
+static term error_type_to_atom(Context *ctx, esp_mqtt_error_type_t error_type)
+{
+    switch (error_type) {
+        case MQTT_ERROR_TYPE_ESP_TLS:
+            return context_make_atom(ctx, esp_tls_atom);
+        case MQTT_ERROR_TYPE_CONNECTION_REFUSED:
+            return context_make_atom(ctx, connection_refused_atom);
+        default:
+            return UNDEFINED_ATOM;
+    }
+}
+
+
+static term connect_return_code_to_atom(Context *ctx, esp_mqtt_connect_return_code_t connect_return_code)
+{
+    switch (connect_return_code) {
+        case MQTT_CONNECTION_ACCEPTED:
+            return context_make_atom(ctx, connection_accepted_atom);
+        case MQTT_CONNECTION_REFUSE_PROTOCOL:
+            return context_make_atom(ctx, protocol_atom);
+        case MQTT_CONNECTION_REFUSE_ID_REJECTED:
+            return context_make_atom(ctx, id_rejected_atom);
+        case MQTT_CONNECTION_REFUSE_SERVER_UNAVAILABLE:
+            return context_make_atom(ctx, server_unavailable_atom);
+        case MQTT_CONNECTION_REFUSE_BAD_USERNAME:
+            return context_make_atom(ctx, bad_username_atom);
+        case MQTT_CONNECTION_REFUSE_NOT_AUTHORIZED:
+            return context_make_atom(ctx, not_authorized_atom);
+        default:
+            return UNDEFINED_ATOM;
+    }
 }
 
 
@@ -393,4 +505,17 @@ static term create_tuple4(Context *ctx, term a, term b, term c, term d)
     terms[3] = d;
 
     return port_create_tuple_n(ctx, 4, terms);
+}
+
+
+static term create_tuple5(Context *ctx, term a, term b, term c, term d, term e)
+{
+    term terms[4];
+    terms[0] = a;
+    terms[1] = b;
+    terms[2] = c;
+    terms[3] = d;
+    terms[4] = e;
+
+    return port_create_tuple_n(ctx, 5, terms);
 }

@@ -28,7 +28,7 @@ start() ->
     %%
     Config = #{
         url => "mqtt://mqtt.eclipseprojects.io",
-        connected_handler => fun handle_connected/2
+        connected_handler => fun handle_connected/1
     },
     {ok, _MQTT} = mqtt:start(Config),
     io:format("MQTT started.~n"),
@@ -43,26 +43,29 @@ loop_forever() ->
 %%
 %% connected callback.  This function will be called
 %%
-handle_connected(MQTT, Url) ->
+handle_connected(MQTT) ->
+    Config = mqtt:get_config(MQTT),
     Topic = <<"atomvm/qos0">>,
-    io:format("Connected to ~p; subscribing to ~p...~n", [Url, Topic]),
+    io:format("Connected to ~p~n", [maps:get(url, Config)]),
+    io:format("Subscribing to ~p...~n", [Topic]),
     ok = mqtt:subscribe(MQTT, Topic, #{
-        qos => 0,
         subscribed_handler => fun handle_subscribed/2,
         data_handler => fun handle_data/3
     }).
 
 handle_subscribed(MQTT, Topic) ->
     io:format("Subscribed to ~p.~n", [Topic]),
-    io:format("Publishing data on topic ~p~n", [Topic]),
-    _ = mqtt:publish(MQTT, Topic, term_to_binary(echo)).
+    io:format("Spawning publish loop on topic ~p~n", [Topic]),
+    spawn(fun() -> publish_loop(MQTT, Topic, 1) end).
 
-handle_data(MQTT, Topic, Data) ->
-    io:format("Received data on topic ~p: ~p ~n", [Topic, binary_to_term(Data)]),
-    timer:sleep(5000),
-    io:format("Publishing data on topic ~p~n", [Topic]),
-    _ = mqtt:publish(MQTT, Topic, term_to_binary(echo)).
-
+handle_data(_MQTT, Topic, Data) ->
+    io:format("Received data on topic ~p: ~p ~n", [Topic, Data]),
+    % io:format("Pending publishes: ~p~n", [mqtt:get_pending_publishes(MQTT)]),
+    % io:format("Pending subscriptions: ~p~n", [mqtt:get_pending_subscriptions(MQTT)]),
+    % io:format("Pending unsubscriptions: ~p~n", [mqtt:get_pending_unsubscriptions(MQTT)]),
+    io:format("process count: ~p~n", [erlang:system_info(process_count)]),
+    io:format("Free heap on handle_data: ~p~n", [erlang:system_info(esp32_free_heap_size)]),
+    ok.
 
 start_network(SSID, Psk) ->
     case network_fsm:wait_for_sta([{ssid, SSID}, {psk, Psk}]) of
@@ -75,3 +78,11 @@ start_network(SSID, Psk) ->
         Error ->
             throw({unable_to_start_network, Error})
     end.
+
+publish_loop(MQTT, Topic, Seq) ->
+    io:format("Publishing data on topic ~p~n", [Topic]),
+    _ = mqtt:publish(MQTT, Topic, list_to_binary("echo" ++ integer_to_list(Seq))),
+    timer:sleep(5000),
+    io:format("process count: ~p~n", [erlang:system_info(process_count)]),
+    io:format("Free heap after publish: ~p~n", [erlang:system_info(esp32_free_heap_size)]),
+    publish_loop(MQTT, Topic, Seq + 1).

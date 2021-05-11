@@ -1,5 +1,5 @@
 %%
-%% Copyright (c) 2020 dushin.net
+%% Copyright (c) 2021 dushin.net
 %% All rights reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,13 +46,15 @@
 -module(mqtt).
 
 -export([
-    start/1, stop/1, publish/3, publish/4, subscribe/3, unsubscribe/3
+    start/1, stop/1, disconnect/1, reconnect/1,
+    get_config/1, get_pending_publishes/1, get_pending_subscriptions/1, get_pending_unsubscriptions/1,
+    publish/3, publish/4, subscribe/3, unsubscribe/3
 ]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -behavior(gen_server).
 
-%-define(TRACE(A, B), io:format(A, B)).
+% -define(TRACE(A, B), io:format(A, B)).
 -define(TRACE(A, B), ok).
 
 -record(state, {
@@ -60,6 +62,7 @@
     config,
     pending_publishes = #{},
     pending_subscriptions = #{},
+    pending_unsubscriptions = #{},
     subscriber_map = #{}
 }).
 
@@ -67,7 +70,6 @@
     msg_id,
     topic,
     subscribed_handler,
-    unsubscribed_handler,
     data_handler
 }).
 
@@ -77,19 +79,30 @@
 -type config() :: #{
     url => binary_or_string(),
     connected_handler => fun((mqtt()) -> any()),
+    disconnected_handler => fun((mqtt()) -> any()),
+    error_handler => fun((mqtt(), error()) -> any()),
     username => binary_or_string(),
     password => binary_or_string()
 }.
 
+-type error_type() :: esp_tls | connection_refused | undefined.
+-type connect_return_code() :: connection_accepted | protocol | id_rejected | server_unavailable | bad_username | not_authorized | undefined.
+-type tls_last_esp_err() :: integer().
+-type tls_stack_err() :: integer().
+-type tls_cert_verify_flags() :: integer().
+-type error() :: {error_type(), connect_return_code(), tls_last_esp_err(), tls_stack_err(), tls_cert_verify_flags()}.
+
+-type qos() :: at_most_once | at_least_once | exactly_once.
+
 -type publish_options() :: #{
-    published_handler => fun((mqtt(), topic()) -> any()) | pid(),
-    qos => {0..2},
+    published_handler => fun((mqtt(), topic(), msg_id()) -> any()) | pid(),
+    qos => qos(),
     retain => boolean()
 }.
 
 -type subscribe_options() :: #{
+    max_qos => qos(),
     subscribed_handler => fun((mqtt(), topic()) -> any()) | pid(),
-    unsubscribed_handler => fun((mqtt(), topic()) -> any()) | pid(),
     data_handler => fun((mqtt(), topic(), binary()) -> any()) | pid()
 }.
 
@@ -98,6 +111,7 @@
 }.
 
 -type topic() :: binary() | string().
+-type msg_id() :: integer().
 
 %%-----------------------------------------------------------------------------
 %% @param   Config      configuration
@@ -176,6 +190,7 @@ start(Config) ->
     gen_server:start(?MODULE, Config, []).
 
 %%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
 %% @returns ok
 %% @doc     Stop the specified MQTT.
 %% @end
@@ -183,6 +198,66 @@ start(Config) ->
 -spec stop(MQTT::mqtt()) -> ok.
 stop(MQTT) ->
     gen_server:call(MQTT, stop).
+
+%%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
+%% @returns ok
+%% @doc     Disconnect the specified MQTT from the MQTT broker.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec disconnect(MQTT::mqtt()) -> ok.
+disconnect(MQTT) ->
+    gen_server:call(MQTT, disconnect).
+
+%%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
+%% @returns ok
+%% @doc     Reconnect the specified MQTT to the MQTT broker.
+%% @end
+%%-----------------------------------------------------------------------------
+-spec reconnect(MQTT::mqtt()) -> ok | error.
+reconnect(MQTT) ->
+    gen_server:call(MQTT, reconnect).
+
+%%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
+%% @returns Configuration used to initialize this MQTT instance
+%% @doc     Get the configuation used to initialize this MQTT instance
+%% @end
+%%-----------------------------------------------------------------------------
+-spec get_config(MQTT::mqtt()) -> config().
+get_config(MQTT) ->
+    gen_server:call(MQTT, config).
+
+%%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
+%% @returns list of message ids representing pending publishes
+%% @doc     Get the list of pending publishes associated with this MQTT instance
+%% @end
+%%-----------------------------------------------------------------------------
+-spec get_pending_publishes(MQTT::mqtt()) -> [msg_id()].
+get_pending_publishes(MQTT) ->
+    gen_server:call(MQTT, pending_publishes).
+
+%%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
+%% @returns list of message ids representing pending subscriptions
+%% @doc     Get the list of pending subscriptions associated with this MQTT instance
+%% @end
+%%-----------------------------------------------------------------------------
+-spec get_pending_subscriptions(MQTT::mqtt()) -> [msg_id()].
+get_pending_subscriptions(MQTT) ->
+    gen_server:call(MQTT, pending_subscriptions).
+
+%%-----------------------------------------------------------------------------
+%% @param   MQTT    the MQTT client instance created via `start/1'
+%% @returns list of message ids representing pending unsubscriptions
+%% @doc     Get the list of pending unsubscriptions associated with this MQTT instance
+%% @end
+%%-----------------------------------------------------------------------------
+-spec get_pending_unsubscriptions(MQTT::mqtt()) -> [msg_id()].
+get_pending_unsubscriptions(MQTT) ->
+    gen_server:call(MQTT, pending_unsubscriptions).
 
 %%-----------------------------------------------------------------------------
 %% @param   MQTT    the MQTT client instance created via `start/1'
@@ -249,7 +324,7 @@ publish(_,_,_) ->
 %% </table>
 %% @end
 %%-----------------------------------------------------------------------------
--spec publish(MQTT::mqtt(), Topic::topic(), Message::binary_or_string(), PublishOptions::publish_options()) -> ok | {error, Reason::term()}.
+-spec publish(MQTT::mqtt(), Topic::topic(), Message::binary_or_string(), PublishOptions::publish_options()) -> msg_id() | {error, Reason::term()}.
 publish(MQTT, Topic, Message, PublishOptions)
     when is_pid(MQTT) andalso (is_binary(Topic) orelse is_list(Topic)) andalso (is_binary(Message) orelse is_list(Message)) andalso is_map(PublishOptions) ->
     gen_server:call(MQTT, {publish, Topic, Message, validate_publish_options(PublishOptions)}, 30000);
@@ -352,15 +427,19 @@ unsubscribe(MQTT, Topic, UnSubscribeOptions)
 unsubscribe(_,_,_) ->
     throw(badarg).
 
+
+%% ============================================================================
 %%
 %% gen_server API
 %%
+%% ============================================================================
 
 %% @hidden
 init(Config) ->
     try
         Self = self(),
         Port = erlang:open_port({spawn, "atomvm_mqtt"}, [{receiver, Self}, {url, maps:get(url, Config)}]),
+        % Port = mqtt_simulator:start(Self),
         {ok, #state{
             port=Port,
             config=Config
@@ -372,27 +451,41 @@ init(Config) ->
 
 %% @hidden
 handle_call(stop, _From, State) ->
-    Reply = do_stop(State#state.port),
-    {stop, Reply, ok, State};
+    do_stop(State#state.port),
+    {stop, normal, ok, State};
+handle_call(disconnect, _From, State) ->
+    Reply = do_disconnect(State#state.port),
+    {reply, Reply, State};
+handle_call(reconnect, _From, State) ->
+    Reply = do_reconnect(State#state.port),
+    {reply, Reply, State};
+handle_call(config, _From, State) ->
+    {reply, State#state.config, State};
+handle_call(pending_publishes, _From, State) ->
+    {reply, maps:keys(State#state.pending_publishes), State};
+handle_call(pending_subscriptions, _From, State) ->
+    {reply, maps:keys(State#state.pending_subscriptions), State};
+handle_call(pending_unsubscriptions, _From, State) ->
+    {reply, maps:keys(State#state.pending_unsubscriptions), State};
 handle_call({publish, Topic, Message, PublishOptions}, _From, State) ->
     ?TRACE("Handling call for publish.  Topic=~p Message: ~p PublishOptions=~p~n", [Topic, Message, PublishOptions]),
-    Qos = maps:get(qos, PublishOptions, 0),
+    Qos = maps:get(qos, PublishOptions, at_most_once),
     Retain = maps:get(retain, PublishOptions, false),
     MsgId = do_publish(State#state.port, Topic, Message, Qos, Retain),
     case Qos of
-        0 ->
+        at_most_once ->
             {reply, ok, State};
         _ ->
             PendingPublishes = State#state.pending_publishes,
             NewPendingPublishes = PendingPublishes#{MsgId => {Topic, PublishOptions}},
-            {reply, ok, State#state{pending_publishes=NewPendingPublishes}}
+            {reply, MsgId, State#state{pending_publishes=NewPendingPublishes}}
     end;
 handle_call({subscribe, Topic, Options}, _From, State) ->
     ?TRACE("Handling call for subscribe.  Topic=~p Options=~p~n", [Topic, Options]),
     SubscriberMap = State#state.subscriber_map,
     case maps:get(Topic, SubscriberMap, undefined) of
         undefined ->
-            Qos = maps:get(qos, Options, 0),
+            Qos = maps:get(qos, Options, at_most_once),
             case do_subscribe(State#state.port, Topic, Qos) of
                 MsgId when is_integer(MsgId) ->
                     ?TRACE("Subscription msg_id: ~p~n", [MsgId]),
@@ -411,31 +504,22 @@ handle_call({subscribe, Topic, Options}, _From, State) ->
         _Subscriber ->
             {reply, {error, already_subscribed}, State}
     end;
-% handle_call({unsubscribe, Topic, Options}, _From, State) ->
-%     ?TRACE("Handling call for subscribe.  Topic=~p Options=~p~n", [Topic, Options]),
-%     SubscriberMap = State#state.subscriber_map,
-%     case maps:get(Topic, SubscriberMap, undefined) of
-%         undefined ->
-%             Qos = maps:get(qos, Options, 0),
-%             % io:format("No subscriber as expected.  Qos=~p~n", [Qos]),
-%             case do_subscribe(State#state.port, Topic, Qos) of
-%                 MsgId when is_integer(MsgId) ->
-%                     % io:format("Subscription msg_id: ~p~n", [MsgId]),
-%                     NewSubscriber = #subscriber{
-%                         msg_id=MsgId,
-%                         topic=Topic,
-%                         subscribed_handler = maps:get(subscribed_handler, Options, undefined),
-%                         data_handler = maps:get(data_handler, Options, undefined)
-%                     },
-%                     % io:format("NewSubscriber=~p~n", [NewSubscriber]),
-%                     NewSubscriberMap = SubscriberMap#{Topic => NewSubscriber},
-%                     {reply, ok, State#state{subscriber_map=NewSubscriberMap}};
-%                 Error ->
-%                     {reply, Error, State}
-%             end;
-%         _Subscriber ->
-%             {reply, {error, already_subscribed}, State}
-%     end;
+handle_call({unsubscribe, Topic, Options}, _From, State) ->
+    ?TRACE("Handling call for unsubscribe.  Topic=~p Options=~p~n", [Topic, Options]),
+    SubscriberMap = State#state.subscriber_map,
+    case maps:get(Topic, SubscriberMap, undefined) of
+        undefined ->
+            {reply, {error, not_subscribed}, State};
+        _ ->
+            case do_unsubscribe(State#state.port, Topic) of
+                MsgId when is_integer(MsgId) ->
+                    PendingUnsubscriptions = State#state.pending_unsubscriptions,
+                    NewPendingUnsubscriptions = PendingUnsubscriptions#{MsgId => {Topic, Options}},
+                    {reply, ok, State#state{pending_unsubscriptions=NewPendingUnsubscriptions}};
+                Error ->
+                    {reply, Error, State}
+            end
+    end;
 handle_call(Request, _From, State) ->
     {reply, {error, {unknown_request, Request}}, State}.
 
@@ -445,17 +529,16 @@ handle_cast(_Msg, State) ->
 
 %% @hidden
 handle_info({mqtt, connected}, State) ->
-    % io:format("handle_info: Received {mqtt, connected} (self=~p)~n", [self()]),
+    ?TRACE("handle_info: Received {mqtt, connected}~n", []),
     Config = State#state.config,
     Self = self(),
-    Url = maps:get(url, Config),
     case maps:get(connected_handler, Config, undefined) of
+        undefined ->
+            ok;
         Pid when is_pid(Pid) ->
-            Pid ! {mqtt, connected, self(), Url};
+            Pid ! {mqtt, connected, self()};
         Fun when is_function(Fun) ->
-            spawn(fun() -> Fun(Self, Url) end);
-        _ ->
-            ok
+            spawn(fun() -> Fun(Self) end)
     end,
     {noreply, State};
 handle_info({mqtt, disconnected}, State) ->
@@ -463,12 +546,25 @@ handle_info({mqtt, disconnected}, State) ->
     Config = State#state.config,
     Self = self(),
     case maps:get(disconnected_handler, Config, undefined) of
+        undefined ->
+            ok;
         Pid when is_pid(Pid) ->
-            Pid ! {mqtt, connected, self()};
+            Pid ! {mqtt, disconnected, self()};
         Fun when is_function(Fun) ->
-            spawn(fun() -> Fun(Self) end);
-        _ ->
-            ok
+            spawn(fun() -> Fun(Self) end)
+    end,
+    {noreply, State};
+handle_info({mqtt, error, Error}, State) ->
+    ?TRACE("handle_info({mqtt, disconnected}~n", []),
+    Config = State#state.config,
+    Self = self(),
+    case maps:get(error_handler, Config, undefined) of
+        undefined ->
+            ok;
+        Pid when is_pid(Pid) ->
+            Pid ! {mqtt, error, self(), Error};
+        Fun when is_function(Fun) ->
+            spawn(fun() -> Fun(Self, Error) end)
     end,
     {noreply, State};
 handle_info({mqtt, published, MsgId}, State) ->
@@ -485,9 +581,9 @@ handle_info({mqtt, published, MsgId}, State) ->
                 default ->
                     ok;
                 Pid when is_pid(Pid) ->
-                    Pid ! {mqtt, published, Self, Topic};
+                    Pid ! {mqtt, published, Self, Topic, MsgId};
                 Fun when is_function(Fun) ->
-                    spawn(fun() -> Fun(Self, Topic) end)
+                    spawn(fun() -> Fun(Self, Topic, MsgId) end)
             end,
             maps:remove(MsgId, PendingPublishes)
     end,
@@ -505,34 +601,43 @@ handle_info({mqtt, subscribed, MsgId}, State) ->
             Topic = Subscriber#subscriber.topic,
             Self = self(),
             case Subscriber#subscriber.subscribed_handler of
+                undefined ->
+                    ok;
                 Pid when is_pid(Pid) ->
                     Pid ! {mqtt, subscribed, Self, Topic};
                 Fun when is_function(Fun) ->
-                    spawn(fun() -> Fun(Self, Topic) end);
-                _ ->
-                    ok
+                    spawn(fun() -> Fun(Self, Topic) end)
             end,
             SubscriberMap#{Topic => Subscriber}
     end,
-    {noreply, State#state{subscriber_map=NewSubscriberMap}};
-% handle_info({mqtt, unsubscribed, MsgId}, State) ->
-%     io:format("handle_info({mqtt, unsubscribed, ~p}~n", [MsgId]),
-%     SubscriberMap = State#state.subscriber_map,
-%     case find_subscriber_by_msgid(SubscriberMap, MsgId) of
-%         undefined ->
-%             io:format("WARNING: `unsubscribed` message received but no subscriber was found for msg id ~p~n", [MsgId]);
-%         {Topic, Subscriber} ->
-%             Self = self(),
-%             case Subscriber#subscriber.unsubscribed_handler of
-%                 Pid when is_pid(Pid) ->
-%                     Pid ! {mqtt, subscribed, Self, Subscriber#subscriber.topic};
-%                 Fun when is_function(Fun) ->
-%                     spawn(fun() -> Fun(Self, Topic) end);
-%                 _ ->
-%                     ok
-%             end
-%     end,
-%     {noreply, State};
+    {noreply, State#state{
+        subscriber_map=NewSubscriberMap,
+        pending_subscriptions=maps:remove(MsgId, PendingSubscriptions)
+    }};
+handle_info({mqtt, unsubscribed, MsgId}, State) ->
+    ?TRACE("handle_info({mqtt, unsubscribed, ~p}~n", [MsgId]),
+    SubscriberMap = State#state.subscriber_map,
+    PendingUnSubscriptions = State#state.pending_unsubscriptions,
+    NewSubscriberMap = case maps:get(MsgId, PendingUnSubscriptions, undefined) of
+        undefined ->
+            io:format("WARNING: `unsubscribed` message received but no pending unsubscription was found for msg id ~p~n", [MsgId]),
+            SubscriberMap;
+        {Topic, Options} ->
+            Self = self(),
+            case maps:get(unsubscribed_handler, Options, default) of
+                default ->
+                    ok;
+                Pid when is_pid(Pid) ->
+                    Pid ! {mqtt, unsubscribed, Self, Topic};
+                Fun when is_function(Fun) ->
+                    spawn(fun() -> Fun(Self, Topic) end)
+            end,
+            maps:remove(Topic, SubscriberMap)
+    end,
+    {noreply, State#state{
+        subscriber_map=NewSubscriberMap,
+        pending_unsubscriptions=maps:remove(MsgId, PendingUnSubscriptions)
+    }};
 handle_info({mqtt, data, Topic, Data}, State) ->
     ?TRACE("handle_info({mqtt, data, ~p ~p}~n", [Topic, Data]),
     SubscriberMap = State#state.subscriber_map,
@@ -542,12 +647,12 @@ handle_info({mqtt, data, Topic, Data}, State) ->
         Subscriber ->
             Self = self(),
             case Subscriber#subscriber.data_handler of
+                undefined ->
+                    ok;
                 Pid when is_pid(Pid) ->
                     Pid ! {mqtt, data, Self, Topic, Data};
                 Fun when is_function(Fun) ->
-                    spawn(fun() -> Fun(Self, Topic, Data) end);
-                _ ->
-                    ok
+                    spawn(fun() -> Fun(Self, Topic, Data) end)
             end
     end,
     {noreply, State};
@@ -556,7 +661,8 @@ handle_info(Info, State) ->
     {noreply, State}.
 
 %% @hidden
-terminate(_Reason, _State) ->
+terminate(Reason, State) ->
+    io:format("mqtt gen_server process ~p terminated with reason ~p.  State: ~p~n", [self(), Reason, State]),
     ok.
 
 %% @hidden
@@ -569,18 +675,28 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% @private
 do_publish(Port, Topic, Message, Qos, Retain) ->
-    call(Port, {publish, Topic, Message, Qos, Retain}).
+    call(Port, {publish, Topic, Message, qos_to_int(Qos), Retain}).
 
 %% @private
 do_subscribe(Port, Topic, Qos) ->
-    call(Port, {subscribe, Topic, Qos}).
+    call(Port, {subscribe, Topic, qos_to_int(Qos)}).
+
+%% @private
+do_unsubscribe(Port, Topic) ->
+    call(Port, {unsubscribe, Topic}).
 
 %% @private
 do_stop(Port) ->
-    case call(Port, stop) of
-        ok -> normal;
-        Error -> Error
-    end.
+    do_disconnect(Port),
+    Port ! stop.
+
+%% @private
+do_disconnect(Port) ->
+    call(Port, disconnect).
+
+%% @private
+do_reconnect(Port) ->
+    call(Port, reconnect).
 
 %% @private
 call(Port, Msg) ->
@@ -591,46 +707,16 @@ call(Port, Msg) ->
             Ret
     end.
 
-% %% @private
-% find_subscriber_by_msgid(SubscriberMap, MsgId) ->
-%     case find_entry(
-%         fun(_Topic, #subscriber{msg_id = Id}) ->
-%             MsgId =:= Id
-%         end,
-%         SubscriberMap
-%     ) of
-%         false ->
-%             undefined;
-%         Entry ->
-%             Entry
-%     end.
-
-% %% @private
-% find_entry(Pred, Map) ->
-%     iterate_find_entry(Pred, maps:next(maps:iterator(Map))).
-
-% %% @private
-% iterate_find_entry(_Pred, none) ->
-%     false;
-% iterate_find_entry(Pred, {Key, Value, Iterator}) ->
-%     case Pred(Key, Value) of
-%         true ->
-%             {Key, Value};
-%         _ ->
-%             iterate_find_entry(Pred, maps:next(Iterator))
-%     end.
-
-
 validate_publish_options(Options) ->
     validate_function_or_pid_or_undefined(published_handler, Options),
-    validate_is_integer_or_undefined(qos, Options),
+    validate_qos_or_undefined(qos, Options),
     validate_is_boolean_or_undefined(retain, Options),
     Options.
 
 validate_subscribe_options(Options) ->
     validate_function_or_pid_or_undefined(subscribed_handler, Options),
     validate_function_or_pid_or_undefined(data_handler, Options),
-    validate_is_integer_or_undefined(qos, Options),
+    validate_qos_or_undefined(qos, Options),
     Options.
 
 validate_unsubscribe_options(Options) ->
@@ -645,12 +731,21 @@ validate_function_or_pid_or_undefined(Key, Options) ->
             throw(badarg)
     end.
 
-validate_is_integer_or_undefined(Key, Options) ->
+validate_qos_or_undefined(Key, Options) ->
     case maps:get(Key, Options, undefined) of
         undefined -> ok;
-        Value when is_integer(Value) -> ok;
+        at_most_once -> ok;
+        at_least_once -> ok;
+        exactly_once -> ok;
         _ ->
             throw(badarg)
+    end.
+
+qos_to_int(Qos) ->
+    case Qos of
+        at_most_once -> 0;
+        at_least_once -> 1;
+        exactly_once -> 2
     end.
 
 validate_is_boolean_or_undefined(Key, Options) ->

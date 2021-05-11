@@ -1,6 +1,6 @@
-# AtomVM ADC Example Program
+# AtomVM MQTT Example Program
 
-The `mqtt_example` program illustrates use of the ADC API by reading the voltage signal on pin 34 once every second, and displaying the result on the console.
+The `mqtt_example` program illustrates use of the MQTT API by connecting to a well-known MQTT broker, and sending and receiving a message on a topic every 5 seconds.  Results are displayed on the console.
 
 > Note.  Building and flashing the `mqtt_example` program requires installation of the [`rebar3`](https://www.rebar3.org) Erlang build tool.
 
