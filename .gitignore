@@ -1,4 +1,6 @@
 _build/**
+doc/**
+.vscode/*
 examples/mqtt_example/rebar.lock
 examples/mqtt_example/_build/**
 examples/mqtt_example/_checkouts/**

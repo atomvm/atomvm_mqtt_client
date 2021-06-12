@@ -8,6 +8,6 @@ For more information about the MQTT interface on the ESP32, see the [IDF SDK Doc
 
 Documentation for this Nif can be found in the following sections:
 
-* [Build Instructions](doc/build.md)
-* [Programmer's Guide](doc/guide.md)
-* [Example Program](doc/example.md)
+* [Build Instructions](markdown/build.md)
+* [Programmer's Guide](markdown/guide.md)
+* [Example Program](examples/mqtt_example/README.md)
