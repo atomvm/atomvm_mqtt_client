@@ -1,4 +1,4 @@
-# Programmer's Guide
+# MQTT Client
 
 The AtomVM MQTT client can be used to publish messages to and subscribe to messages posted to topics on an MQTT broker.
 
@@ -18,7 +18,25 @@ The following MQTT Quality of Service (QoS) parameters may be specified when pub
 * `at_least_once` The client will post at least one (but possibly more) copies of the message to the topic.  The client application will be notified (possibly multiple times) when the message has been published to the topic.
 * `exactly_once` The client will post one (and only one) copy of the message to the topic.  The client application will be notified when the message has been published to the topic.
 
-## Callback Architecture
+The AtomVM MQTT client is only supported on the ESP32 platform.
+
+## Build Instructions
+
+The AtomVM MQTT client is implemented as an AtomVM component, which includes some native C code that must be linked into the ESP32 AtomVM image.  In order to build and deploy this client code, you must build an AtomVM binary image.
+
+For general instructions about how to build AtomVM and include third-party components into an AtomVM image, see the [AtomVM Build Instructions](https://doc.atomvm.net/build-instructions.html).
+
+Once the AtomVM image including this component has been built, you can flash the image to your ESP32 device.  For instructions about how to flash AtomVM images to your ESP32 device, see the AtomVM [Getting Started Guide](https://doc.atomvm.net/getting-started-guide.html).
+
+Once the AtomVM image including this component has been flashed to your ESP32 device, you can then include this project into your [`rebar3`](https://www.rebar3.org) project using the [`atomvm_rebar3_plugin`](https://github.com/atomvm/atomvm_rebar3_plugin), which provides targets for building AtomVM packbeam files and flashing them to your device.
+
+## Programmers Guide
+
+This section provides information about how to program your Erlang or Elixir AtomVM program using the MQTT client library.
+
+The MQTT client API is encapsulated in the `mqtt_client` Erlang module.  This module contains all functionality associated with the object lifecyle of the client instance, and through which users publish and subscribe to topics,
+
+### Callback Architecture
 
 Much of the interaction with this module is via callback functions or via messages delivered to a specified PID.  For example, the `start` method will start and MQTT client instance, but notification that the client is connected to the specified broker is performed asynchronously via a callback function or a well-defined message delivered to a designated process.  Similarly, notifications of publishes (QoS1) and subscriptions are performed via callbacks.
 
@@ -29,7 +47,7 @@ Alternatively, users may specify a PID to which messages should be delivered whe
 Messages are sent as tuples with the atom `mqtt' as the first element, and subsequent elements relevant to the specific context (e.g., the MQTT topic or the message being delivered).  See the documentation for each function for expected message structure for such notification messages.
 
 
-## Lifecycle and connection Management
+### Lifecycle and connection Management
 
 The MQTT client functionality is encapsulated in an Erlang process which you can start via the `start/1` function:
 
@@ -37,7 +55,7 @@ The MQTT client functionality is encapsulated in an Erlang process which you can
     Config = #{
         ...
     },
-    {ok, MQTT} = mqtt:start(Config).
+    {ok, MQTT} = mqtt_client:start(Config).
 
 The returned reference should be used for subsequent operations.
 
@@ -86,16 +104,16 @@ The Error term is a 5-tuple encapsulated in the following `error()` type specifi
 To stop an MQTT client instance, use the `stop/1` function, supplying a reference to the MQTT client instance returned from `start/1`:
 
     %% erlang
-    ok = mqtt:stop(MQTT).
+    ok = mqtt_client:stop(MQTT).
 
-## Publishing messages to an MQTT topic
+### Publishing messages to an MQTT topic
 
 You can publish a message using the `publish/4`
 
     %% erlang
     Topic = <<"atomvm/topic0">>,
     Message = <<"Hello!">>,
-    MsgId = mqtt:publish(MTQQ, Topic, Message).
+    MsgId = mqtt_client:publish(MTQQ, Topic, Message).
 
 The above function call will publish a message to the specified topic using the MQTT QoS `at_most_once`.  Note that messages sent with `at_most_once` QoS are not subject to notification.
 
@@ -110,7 +128,7 @@ You can specify `at_least_once` or `exactly_once` delivery using the `qos` optio
         qos => exactly_once,
         published_handler => fun handle_publish/3
     },
-    ok = mqtt:publish(MQTT, Topic, Message, PublishOptions).
+    ok = mqtt_client:publish(MQTT, Topic, Message, PublishOptions).
 
 You can specify a `published_handler` callback function or PID that will be notified when the message is published to the MQTT broker.
 
@@ -123,7 +141,7 @@ A publish handler will be passed the MQTT client instance, topic, and message id
 
 > Note. A `publish_handler` will not be notified if the the message is published with QoS `at_most_once`.
 
-## Subscribing to an MQTT topic
+### Subscribing to an MQTT topic
 
 Subscribe to an MQTT topic by using the `subscribe/3` function.  Specify a topic and optionally a callback for notification that the MQTT broker has acknowledged your subscription (`subscribed_handler`), as well as a callback for notification that a message has been received (`data_handler`):
 
@@ -133,7 +151,7 @@ Subscribe to an MQTT topic by using the `subscribe/3` function.  Specify a topic
         subscribed_handler = fun handle_subscribed/2,
         data_handler = fun handle_data/3
     },
-    ok = mqtt:subscribe(MTQQ, Topic, SubscribeOptions).
+    ok = mqtt_client:subscribe(MTQQ, Topic, SubscribeOptions).
 
 The `subscribe/3` function will return `{error, already_subscribed}` if the client application is already subscribed to the specified topic.
 
@@ -153,7 +171,7 @@ The `data_handler` will be passed the MQTT client instance, topic on which the m
         io:format("Received message ~p on topic ~p~n", [Message, Topic]),
         ...
 
-## Unsubscribing from an MQTT topic
+### Unsubscribing from an MQTT topic
 
 Use the `unscibscribe/3` function to unsubscribe from a topic.
 
@@ -162,7 +180,7 @@ Use the `unscibscribe/3` function to unsubscribe from a topic.
     UnSubscribeOptions = #{
         unsubscribed_handler = fun handle_unsubscribed/2
     },
-    ok = mqtt:unsubscribe(MTQQ, Topic, UnSubscribeOptions).
+    ok = mqtt_client:unsubscribe(MTQQ, Topic, UnSubscribeOptions).
 
 The `unsubscribe/3` function will return `{error, not_subscribed}` if the client application is not yet subscribed to the specified topic.
 
@@ -173,19 +191,19 @@ The `unsubscribed_handler` will be passed the MQTT client instance and topic fro
         io:format("Unsubscribed from topic ~p~n", [Topic]),
         ...
 
-## Advanced Configuration
+### Advanced Configuration
 
 TODO
 
-### Host and Port Settings
+#### Host and Port Settings
 
-### Username/Password authentication
+#### Username/Password authentication
 
-### Connecting via TLS
+#### Connecting via TLS
 
-#### Client TLS Authentication
+##### Client TLS Authentication
 
-### Buffer Settings and KeepAlive
+#### Buffer Settings and KeepAlive
 
 ## API Reference
 

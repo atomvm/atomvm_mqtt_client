@@ -43,7 +43,7 @@
 %% for expected message structure for such notification messages.
 %% @end
 %%-----------------------------------------------------------------------------
--module(mqtt).
+-module(mqtt_client).
 
 -export([
     start/1, stop/1, disconnect/1, reconnect/1,
@@ -197,7 +197,7 @@ start(Config) ->
 %%-----------------------------------------------------------------------------
 -spec stop(MQTT::mqtt()) -> ok.
 stop(MQTT) ->
-    gen_server:call(MQTT, stop).
+    gen_server:stop(MQTT).
 
 %%-----------------------------------------------------------------------------
 %% @param   MQTT    the MQTT client instance created via `start/1'
@@ -438,8 +438,7 @@ unsubscribe(_,_,_) ->
 init(Config) ->
     try
         Self = self(),
-        Port = erlang:open_port({spawn, "atomvm_mqtt"}, [{receiver, Self}, {url, maps:get(url, Config)}]),
-        % Port = mqtt_simulator:start(Self),
+        Port = erlang:open_port({spawn, "atomvm_mqtt_client"}, [{receiver, Self}, {url, maps:get(url, Config)}]),
         {ok, #state{
             port=Port,
             config=Config
@@ -450,9 +449,6 @@ init(Config) ->
     end.
 
 %% @hidden
-handle_call(stop, _From, State) ->
-    do_stop(State#state.port),
-    {stop, normal, ok, State};
 handle_call(disconnect, _From, State) ->
     Reply = do_disconnect(State#state.port),
     {reply, Reply, State};
@@ -663,6 +659,7 @@ handle_info(Info, State) ->
 %% @hidden
 terminate(Reason, State) ->
     io:format("mqtt gen_server process ~p terminated with reason ~p.  State: ~p~n", [self(), Reason, State]),
+    do_stop(State#state.port),
     ok.
 
 %% @hidden

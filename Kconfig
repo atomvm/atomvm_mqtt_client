@@ -1,0 +1,9 @@
+menu "ATOMVM_MQTT_CLIENT Configuration"
+
+config AVM_MQTT_CLIENT_ENABLE
+	bool  "Enable AtomVM MQTT_CLIENT driver"
+	default y
+	help
+		Use this parameter to enable or disable the AtomVM MQTT_CLIENT driver.
+
+endmenu

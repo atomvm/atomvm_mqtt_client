@@ -15,12 +15,13 @@
 // limitations under the License.
 //
 
-#include "atomvm_mqtt_driver.h"
+#include "atomvm_mqtt_client.h"
 
 #include <atom.h>
 #include <bif.h>
 #include <context.h>
 #include <debug.h>
+#include <esp32_sys.h>
 #include <defaultatoms.h>
 #include <globalcontext.h>
 #include <interop.h>
@@ -87,57 +88,6 @@ struct platform_data {
     esp_mqtt_client_handle_t client;
     term receiver;
 };
-
-void atomvm_mqtt_driver_init(GlobalContext *global)
-{
-    esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
-}
-
-Context *atomvm_mqtt_driver_create_port(GlobalContext *global, term opts)
-{
-    term receiver = interop_proplist_get_value(opts, make_atom(global, receiver_atom));
-    term url_term = interop_proplist_get_value(opts, make_atom(global, url));
-
-    int ok;
-    char *url_str = interop_term_to_string(url_term, &ok);
-    if (!ok) {
-        ESP_LOGE(TAG, "Error: url is not a proper string or binary.");
-        return NULL;
-    }
-    if (UNLIKELY(IS_NULL_PTR(url_str))) {
-        ESP_LOGE(TAG, "Error: Unable to allocate url string.");
-        return NULL;
-    }
-
-    Context *ctx = context_new(global);
-    ctx->native_handler = consume_mailbox;
-
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .uri = url_str,
-        .event_handle = mqtt_event_handler,
-        .user_context = (void *) ctx
-    };
-    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
-    free(url_str);
-    if (UNLIKELY(IS_NULL_PTR(client))) {
-        ESP_LOGE(TAG, "Error: Unable to initialize MQTT client.\n");
-        return NULL;
-    }
-    esp_err_t err = esp_mqtt_client_start(client);
-    if (err != ESP_OK) {
-        context_destroy(ctx);
-        ESP_LOGE(TAG, "Error: Unable to start MQTT client.  Error: %i.\n", err);
-        return NULL;
-    }
-
-    struct platform_data *plfdat = malloc(sizeof(struct platform_data));
-    plfdat->client = client;
-    plfdat->receiver = receiver;
-    ctx->platform_data = plfdat;
-
-    TRACE(TAG ": MQTT started.\n");
-    return ctx;
-}
 
 
 static void consume_mailbox(Context *ctx)
@@ -519,3 +469,59 @@ static term create_tuple5(Context *ctx, term a, term b, term c, term d, term e)
 
     return port_create_tuple_n(ctx, 5, terms);
 }
+
+void atomvm_mqtt_client_init(GlobalContext *global)
+{
+    esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
+}
+
+Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
+{
+    term receiver = interop_proplist_get_value(opts, make_atom(global, receiver_atom));
+    term url_term = interop_proplist_get_value(opts, make_atom(global, url));
+
+    int ok;
+    char *url_str = interop_term_to_string(url_term, &ok);
+    if (!ok) {
+        ESP_LOGE(TAG, "Error: url is not a proper string or binary.");
+        return NULL;
+    }
+    if (UNLIKELY(IS_NULL_PTR(url_str))) {
+        ESP_LOGE(TAG, "Error: Unable to allocate url string.");
+        return NULL;
+    }
+
+    Context *ctx = context_new(global);
+    ctx->native_handler = consume_mailbox;
+
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .uri = url_str,
+        .event_handle = mqtt_event_handler,
+        .user_context = (void *) ctx
+    };
+    esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    free(url_str);
+    if (UNLIKELY(IS_NULL_PTR(client))) {
+        ESP_LOGE(TAG, "Error: Unable to initialize MQTT client.\n");
+        return NULL;
+    }
+    esp_err_t err = esp_mqtt_client_start(client);
+    if (err != ESP_OK) {
+        context_destroy(ctx);
+        ESP_LOGE(TAG, "Error: Unable to start MQTT client.  Error: %i.\n", err);
+        return NULL;
+    }
+
+    struct platform_data *plfdat = malloc(sizeof(struct platform_data));
+    plfdat->client = client;
+    plfdat->receiver = receiver;
+    ctx->platform_data = plfdat;
+
+    TRACE(TAG ": MQTT started.\n");
+    return ctx;
+}
+
+#include <sdkconfig.h>
+#ifdef CONFIG_AVM_MQTT_CLIENT_ENABLE
+REGISTER_PORT_DRIVER(atomvm_mqtt_client, atomvm_mqtt_client_init, atomvm_mqtt_client_create_port)
+#endif
