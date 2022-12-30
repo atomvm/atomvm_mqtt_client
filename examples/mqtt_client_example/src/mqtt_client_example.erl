@@ -68,7 +68,7 @@ handle_data(_MQTT, Topic, Data) ->
     ok.
 
 start_network(StaConfig) ->
-    case network_fsm:wait_for_sta(StaConfig) of
+    case network:wait_for_sta(StaConfig) of
         {ok, {Address, Netmask, Gateway}} ->
             io:format(
                 "Acquired IP address: ~s Netmask: ~s Gateway: ~s~n",

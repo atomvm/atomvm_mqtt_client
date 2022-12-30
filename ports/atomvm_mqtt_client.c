@@ -77,7 +77,7 @@ static term do_unsubscribe(Context *ctx, term topic);
 static void do_stop(Context *ctx);
 static term do_disconnect(Context *ctx);
 static term do_reconnect(Context *ctx);
-static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event);
+static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event);
 static term make_atom(GlobalContext *global, const char *string);
 static term error_type_to_atom(Context *ctx, esp_mqtt_error_type_t error_type);
 static term connect_return_code_to_atom(Context *ctx, esp_mqtt_connect_return_code_t connect_return_code);
@@ -274,8 +274,7 @@ static term do_reconnect(Context *ctx)
     return OK_ATOM;
 }
 
-
-static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
+static esp_err_t mqtt_event_handler_cb(esp_mqtt_event_handle_t event)
 {
     Context *ctx = (Context *) event->user_context;
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
@@ -404,6 +403,11 @@ static esp_err_t mqtt_event_handler(esp_mqtt_event_handle_t event)
     return ESP_OK;
 }
 
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
+{
+    ESP_LOGD(TAG, "Event dispatched from event loop base=%s, event_id=%d", base, event_id);
+    mqtt_event_handler_cb(event_data);
+}
 
 static term error_type_to_atom(Context *ctx, esp_mqtt_error_type_t error_type)
 {
@@ -494,28 +498,34 @@ Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
     Context *ctx = context_new(global);
     ctx->native_handler = consume_mailbox;
 
+    struct platform_data *plfdat = malloc(sizeof(struct platform_data));
+    plfdat->receiver = receiver;
+    ctx->platform_data = plfdat;
+
     esp_mqtt_client_config_t mqtt_cfg = {
         .uri = url_str,
-        .event_handle = mqtt_event_handler,
+        // .event_handle = mqtt_event_handler,
         .user_context = (void *) ctx
     };
+    printf("FDUSHIN> esp_mqtt_client_init\n");
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
+    printf("FDUSHIN> got client.\n");
     free(url_str);
     if (UNLIKELY(IS_NULL_PTR(client))) {
         ESP_LOGE(TAG, "Error: Unable to initialize MQTT client.\n");
         return NULL;
     }
+
+    esp_mqtt_client_register_event(client, ESP_EVENT_ANY_ID, mqtt_event_handler, client);
+
+    printf("FDUSHIN> esp_mqtt_client_start\n");
     esp_err_t err = esp_mqtt_client_start(client);
     if (err != ESP_OK) {
         context_destroy(ctx);
         ESP_LOGE(TAG, "Error: Unable to start MQTT client.  Error: %i.\n", err);
         return NULL;
     }
-
-    struct platform_data *plfdat = malloc(sizeof(struct platform_data));
     plfdat->client = client;
-    plfdat->receiver = receiver;
-    ctx->platform_data = plfdat;
 
     TRACE(TAG ": MQTT started.\n");
     return ctx;
