@@ -1,4 +1,4 @@
-src/config.erl
 _build/**
 _checkouts/**
+src/config.erl
 rebar.lock
