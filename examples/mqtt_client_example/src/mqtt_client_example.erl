@@ -1,5 +1,5 @@
 %%
-%% Copyright (c) 2021 dushin.net
+%% Copyright (c) 2021-2023 dushin.net
 %% All rights reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,16 +33,8 @@ start() ->
     {ok, _MQTT} = mqtt_client:start(Config),
     io:format("MQTT started.~n"),
 
-    loop_forever().
+    timer:sleep(infinity).
 
-loop_forever() ->
-    receive
-        halt -> halt
-    end.
-
-%%
-%% connected callback.  This function will be called
-%%
 handle_connected(MQTT) ->
     Config = mqtt_client:get_config(MQTT),
     Topic = <<"atomvm/qos0">>,
@@ -60,15 +52,10 @@ handle_subscribed(MQTT, Topic) ->
 
 handle_data(_MQTT, Topic, Data) ->
     io:format("Received data on topic ~p: ~p ~n", [Topic, Data]),
-    % io:format("Pending publishes: ~p~n", [mqtt_client:get_pending_publishes(MQTT)]),
-    % io:format("Pending subscriptions: ~p~n", [mqtt_client:get_pending_subscriptions(MQTT)]),
-    % io:format("Pending unsubscriptions: ~p~n", [mqtt_client:get_pending_unsubscriptions(MQTT)]),
-    io:format("process count: ~p~n", [erlang:system_info(process_count)]),
-    io:format("Free heap on handle_data: ~p~n", [erlang:system_info(esp32_free_heap_size)]),
     ok.
 
 start_network(StaConfig) ->
-    case network_fsm:wait_for_sta(StaConfig) of
+    case network:wait_for_sta(StaConfig) of
         {ok, {Address, Netmask, Gateway}} ->
             io:format(
                 "Acquired IP address: ~s Netmask: ~s Gateway: ~s~n",
@@ -81,8 +68,27 @@ start_network(StaConfig) ->
 
 publish_loop(MQTT, Topic, Seq) ->
     io:format("Publishing data on topic ~p~n", [Topic]),
-    _ = mqtt_client:publish(MQTT, Topic, list_to_binary("echo" ++ integer_to_list(Seq))),
-    timer:sleep(5000),
-    io:format("process count: ~p~n", [erlang:system_info(process_count)]),
-    io:format("Free heap after publish: ~p~n", [erlang:system_info(esp32_free_heap_size)]),
+    try
+        Self = self(),
+        HandlePublished = fun(MQTT2, Topic2, MsgId) ->
+            Self ! published,
+            handle_published(MQTT2, Topic2, MsgId)
+        end,
+        PublishOptions = #{qos => at_least_once, published_handler => HandlePublished},
+        Msg = list_to_binary("echo" ++ integer_to_list(Seq)),
+        _ = mqtt_client:publish(MQTT, Topic, Msg, PublishOptions),
+        receive
+            published ->
+                ok
+        after 10000 ->
+            io:format("Timed out waiting for publish ack~n")
+        end
+    catch
+        C:E:S ->
+            io:format("Error in publish: ~p:~p~p~n", [C, E, S])
+    end,
+    timer:sleep(1000),
     publish_loop(MQTT, Topic, Seq + 1).
+
+handle_published(MQTT, Topic, MsgId) ->
+    io:format("MQTT ~p published to topic ~p msg_id=~p~n", [MQTT, Topic, MsgId]).

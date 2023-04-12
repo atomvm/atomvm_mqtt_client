@@ -1,5 +1,5 @@
 %%
-%% Copyright (c) 2021 dushin.net
+%% Copyright (c) 2021-2023 dushin.net
 %% All rights reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,7 +46,7 @@
 -module(mqtt_client).
 
 -export([
-    start/1, stop/1, disconnect/1, reconnect/1,
+    start/1, start/2, start_link/1, start_link/2, stop/1, disconnect/1, reconnect/1,
     get_config/1, get_pending_publishes/1, get_pending_subscriptions/1, get_pending_unsubscriptions/1,
     publish/3, publish/4, subscribe/3, unsubscribe/3
 ]).
@@ -54,7 +54,7 @@
 
 -behavior(gen_server).
 
-% -define(TRACE(A, B), io:format(A, B)).
+% -define(TRACE(A, B), io:format("[mqtt_client] " ++ A, B)).
 -define(TRACE(A, B), ok).
 
 -record(state, {
@@ -82,7 +82,9 @@
     disconnected_handler => fun((mqtt()) -> any()),
     error_handler => fun((mqtt(), error()) -> any()),
     username => binary_or_string(),
-    password => binary_or_string()
+    password => binary_or_string(),
+    client_id => binary_or_string(),
+    trusted_cert => binary_or_string()
 }.
 
 -type error_type() :: esp_tls | connection_refused | undefined.
@@ -188,6 +190,18 @@
 -spec start(Config::config()) -> {ok, mqtt()} | {error, Reason::term()}.
 start(Config) ->
     gen_server:start(?MODULE, Config, []).
+
+-spec start(ServerName :: {local, atom()}, Config::config()) -> {ok, mqtt()} | {error, Reason::term()}.
+start(ServerName, Config) ->
+    gen_server:start(ServerName, ?MODULE, Config, []).
+
+-spec start_link(Config::config()) -> {ok, mqtt()} | {error, Reason::term()}.
+start_link(Config) ->
+    gen_server:start_link(?MODULE, Config, []).
+
+-spec start_link(ServerName :: {local, atom()}, Config::config()) -> {ok, mqtt()} | {error, Reason::term()}.
+start_link(ServerName, Config) ->
+    gen_server:start_link(ServerName, ?MODULE, Config, []).
 
 %%-----------------------------------------------------------------------------
 %% @param   MQTT    the MQTT client instance created via `start/1'
@@ -473,6 +487,7 @@ handle_call({publish, Topic, Message, PublishOptions}, _From, State) ->
             {reply, ok, State};
         _ ->
             PendingPublishes = State#state.pending_publishes,
+            ?TRACE("qos=~p msg_id=~p PendingPublishes=~p~n", [Qos, MsgId, PendingPublishes]),
             NewPendingPublishes = PendingPublishes#{MsgId => {Topic, PublishOptions}},
             {reply, MsgId, State#state{pending_publishes=NewPendingPublishes}}
     end;
@@ -568,7 +583,7 @@ handle_info({mqtt, published, MsgId}, State) ->
     PendingPublishes = State#state.pending_publishes,
     NewPendingPublishes = case maps:get(MsgId, PendingPublishes, undefined) of
         undefined ->
-            io:format("WARNING: `published` message received but no subscriber was found for msg id ~p~n", [MsgId]),
+            io:format("WARNING: `published` message received but no callback was found for msg id ~p~n", [MsgId]),
             PendingPublishes;
         {Topic, PublishOptions} ->
             ?TRACE("Found pending publish.  Topic=~p PublishOptions=~p~n", [Topic, PublishOptions]),
@@ -672,37 +687,28 @@ code_change(_OldVsn, State, _Extra) ->
 
 %% @private
 do_publish(Port, Topic, Message, Qos, Retain) ->
-    call(Port, {publish, Topic, Message, qos_to_int(Qos), Retain}).
+    port:call(Port, {publish, Topic, Message, qos_to_int(Qos), Retain}).
 
 %% @private
 do_subscribe(Port, Topic, Qos) ->
-    call(Port, {subscribe, Topic, qos_to_int(Qos)}).
+    port:call(Port, {subscribe, Topic, qos_to_int(Qos)}).
 
 %% @private
 do_unsubscribe(Port, Topic) ->
-    call(Port, {unsubscribe, Topic}).
+    port:call(Port, {unsubscribe, Topic}).
 
 %% @private
 do_stop(Port) ->
-    do_disconnect(Port),
+    port:do_disconnect(Port),
     Port ! stop.
 
 %% @private
 do_disconnect(Port) ->
-    call(Port, disconnect).
+    port:call(Port, disconnect).
 
 %% @private
 do_reconnect(Port) ->
-    call(Port, reconnect).
-
-%% @private
-call(Port, Msg) ->
-    Ref = make_ref(),
-    Port ! {self(), Ref, Msg},
-    receive
-        {Ref, Ret} ->
-            Ret
-    end.
+    port:call(Port, reconnect).
 
 validate_publish_options(Options) ->
     validate_function_or_pid_or_undefined(published_handler, Options),
