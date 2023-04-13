@@ -4,9 +4,14 @@
 #  SPDX-License-Identifier: Apache-2.0 OR LGPL-2.1-or-later
 #
 
-name: "Build MQTT Client"
+name: "Build atomvm_mqtt_client"
 
-on: ["push", "pull_request"]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * *'
 
 jobs:
   esp32-build:
@@ -47,8 +52,6 @@ jobs:
 
     - name: "Check out AtomVM"
       run: |
-        pwd
-        ls -l
         git clone https://github.com/atomvm/AtomVM
         cd AtomVM
         git rev-parse --short HEAD
@@ -63,13 +66,13 @@ jobs:
     - name: "Build erlang and Elixir libs"
       working-directory: AtomVM/build/libs
       run: |
-        make
+        make atomvmlib
 
     - name: "Build ${{ matrix.soc }} AtomVM with atomvm_mqtt_client"
       working-directory: ./AtomVM/src/platforms/esp32/
       run: |
         cd components
-        ln -s /__w/atomvm_mqtt_client/atomvm_mqtt_client
+        ln -s ../../../../../../atomvm_mqtt_client
         cd ..
         . $IDF_PATH/export.sh
         idf.py set-target ${{ matrix.soc }}
@@ -136,10 +139,6 @@ jobs:
     steps:
       - name: "Download artifacts"
         uses: actions/download-artifact@v3
-
-      - name: Display structure of downloaded files
-        run: |
-          ls -R
 
       - name: Upload latest release
         uses: pyTooling/Actions/releaser@main
