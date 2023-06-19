@@ -526,15 +526,19 @@ handle_call({publish, Topic, Message, PublishOptions}, _From, State) ->
     ]),
     Qos = maps:get(qos, PublishOptions, at_most_once),
     Retain = maps:get(retain, PublishOptions, false),
-    MsgId = do_publish(State#state.port, Topic, Message, Qos, Retain),
-    case Qos of
-        at_most_once ->
-            {reply, ok, State};
-        _ ->
-            PendingPublishes = State#state.pending_publishes,
-            ?TRACE("qos=~p msg_id=~p PendingPublishes=~p~n", [Qos, MsgId, PendingPublishes]),
-            NewPendingPublishes = PendingPublishes#{MsgId => {Topic, PublishOptions}},
-            {reply, MsgId, State#state{pending_publishes = NewPendingPublishes}}
+    case do_publish(State#state.port, Topic, Message, Qos, Retain) of
+        {ok, MsgId} ->
+            case Qos of
+                at_most_once ->
+                    {reply, ok, State};
+                _ ->
+                    PendingPublishes = State#state.pending_publishes,
+                    ?TRACE("qos=~p msg_id=~p PendingPublishes=~p~n", [Qos, MsgId, PendingPublishes]),
+                    NewPendingPublishes = PendingPublishes#{MsgId => {Topic, PublishOptions}},
+                    {reply, MsgId, State#state{pending_publishes = NewPendingPublishes}}
+            end;
+        Error ->
+            {reply, Error, State}
     end;
 handle_call({subscribe, Topic, Options}, _From, State) ->
     ?TRACE("Handling call for subscribe.  Topic=~p Options=~p~n", [Topic, Options]),
@@ -543,7 +547,7 @@ handle_call({subscribe, Topic, Options}, _From, State) ->
         undefined ->
             Qos = maps:get(qos, Options, at_most_once),
             case do_subscribe(State#state.port, Topic, Qos) of
-                MsgId when is_integer(MsgId) ->
+                {ok, MsgId} when is_integer(MsgId) ->
                     ?TRACE("Subscription msg_id: ~p~n", [MsgId]),
                     NewSubscriber = #subscriber{
                         msg_id = MsgId,
@@ -568,7 +572,7 @@ handle_call({unsubscribe, Topic, Options}, _From, State) ->
             {reply, {error, not_subscribed}, State};
         _ ->
             case do_unsubscribe(State#state.port, Topic) of
-                MsgId when is_integer(MsgId) ->
+                {ok, MsgId} when is_integer(MsgId) ->
                     PendingUnsubscriptions = State#state.pending_unsubscriptions,
                     NewPendingUnsubscriptions = PendingUnsubscriptions#{MsgId => {Topic, Options}},
                     {reply, ok, State#state{pending_unsubscriptions = NewPendingUnsubscriptions}};

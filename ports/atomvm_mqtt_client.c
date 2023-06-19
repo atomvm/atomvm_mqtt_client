@@ -49,10 +49,13 @@ static const char *const host_atom =                    ATOM_STR("\x4", "host");
 static const char *const mqtt_atom =                    ATOM_STR("\x4", "mqtt");
 static const char *const password_atom =                ATOM_STR("\x8", "password");
 static const char *const port_atom =                    ATOM_STR("\x4", "port");
+static const char *const publish_failed_atom =          ATOM_STR("\xE", "publish_failed");
 static const char *const published_atom =               ATOM_STR("\x9", "published");
 static const char *const receiver_atom =                ATOM_STR("\x8", "receiver");
+static const char *const subscribe_failed_atom =        ATOM_STR("\x10", "subscribe_failed");
 static const char *const subscribed_atom =              ATOM_STR("\xA", "subscribed");
 // static const char *const transport_atom =               ATOM_STR("\x9", "transport");
+static const char *const unsubscribe_failed_atom =        ATOM_STR("\x12", "unsubscribe_failed");
 static const char *const unsubscribed_atom =            ATOM_STR("\xC", "unsubscribed");
 static const char *const url_atom =                     ATOM_STR("\x3", "url");
 static const char *const username_atom =                ATOM_STR("\x8", "username");
@@ -118,7 +121,7 @@ static term make_atom(GlobalContext *global, const char *string)
     return term_from_atom_index(global_atom_index);
 }
 
-static term create_tuple4(Context *ctx, term a, term b, term c, term d)
+static term heap_create_tuple4(Heap *heap, term a, term b, term c, term d)
 {
     term terms[4];
     terms[0] = a;
@@ -126,10 +129,10 @@ static term create_tuple4(Context *ctx, term a, term b, term c, term d)
     terms[2] = c;
     terms[3] = d;
 
-    return port_create_tuple_n(ctx, 4, terms);
+    return port_heap_create_tuple_n(heap, 4, terms);
 }
 
-static term create_tuple5(Context *ctx, term a, term b, term c, term d, term e)
+static term heap_create_tuple5(Heap *heap, term a, term b, term c, term d, term e)
 {
     term terms[4];
     terms[0] = a;
@@ -138,7 +141,7 @@ static term create_tuple5(Context *ctx, term a, term b, term c, term d, term e)
     terms[3] = d;
     terms[4] = e;
 
-    return port_create_tuple_n(ctx, 5, terms);
+    return port_heap_create_tuple_n(heap, 5, terms);
 }
 
 static term error_type_to_atom(GlobalContext *global, esp_mqtt_error_type_t error_type)
@@ -150,6 +153,43 @@ static term error_type_to_atom(GlobalContext *global, esp_mqtt_error_type_t erro
             return make_atom(global, connection_refused_atom);
         default:
             return UNDEFINED_ATOM;
+    }
+}
+
+static void sync_send_message(term pid, term message, GlobalContext *global)
+{
+    int local_process_id = term_to_local_process_id(pid);
+
+    Context *target = globalcontext_get_process_lock(global, local_process_id);
+    mailbox_send(target, message);
+    globalcontext_get_process_unlock(global, target);
+}
+
+static void sync_send_reply(Context *ctx, term pid, uint64_t ref_ticks, term return_value)
+{
+    // Pid ! {Ref :: reference(), ReturnValue :: term()}
+    if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(2) + REF_SIZE, 1, &return_value, MEMORY_NO_SHRINK) != MEMORY_GC_OK)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.\n", __FILE__, __LINE__);
+        sync_send_message(pid, OUT_OF_MEMORY_ATOM, ctx->global);
+    } else {
+        term return_tuple = term_alloc_tuple(2, &ctx->heap);
+        term_put_tuple_element(return_tuple, 0, term_from_ref_ticks(ref_ticks, &ctx->heap));
+        term_put_tuple_element(return_tuple, 1, return_value);
+        sync_send_message(pid, return_tuple, ctx->global);
+    }
+}
+
+static void sync_send_error_tuple(Context *ctx, term pid, uint64_t ref_ticks, term reason)
+{
+    if (UNLIKELY(memory_ensure_free_with_roots(ctx, TUPLE_SIZE(2), 1, &reason, MEMORY_NO_SHRINK) != MEMORY_GC_OK)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.\n", __FILE__, __LINE__);
+        sync_send_message(pid, OUT_OF_MEMORY_ATOM, ctx->global);
+    } else {
+        term error_tuple = term_alloc_tuple(2, &ctx->heap);
+        term_put_tuple_element(error_tuple, 0, ERROR_ATOM);
+        term_put_tuple_element(error_tuple, 1, reason);
+
+        sync_send_reply(ctx, pid, ref_ticks, error_tuple);
     }
 }
 
@@ -189,15 +229,26 @@ static term connect_return_code_to_atom(GlobalContext *global, esp_mqtt_connect_
     }
 }
 
-static term do_publish(Context *ctx, term topic, term data, term qos, term retain)
+static void do_publish(Context *ctx, term pid, uint64_t ref_ticks, term topic, term data, term qos, term retain)
 {
+    TRACE(TAG ": do_publish\n");
+    GlobalContext *global = ctx->global;
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
     esp_mqtt_client_handle_t client = plfdat->client;
+
+    // {ok, MsgId :: integer()} | {error, Reason}
+    if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        sync_send_message(pid, OUT_OF_MEMORY_ATOM, global);
+    }
 
     int ok;
     char *topic_str = interop_term_to_string(topic, &ok);
     if (!ok) {
-        return BADARG_ATOM;
+        ESP_LOGE(TAG, "Error: topic is not a string.");
+        sync_send_error_tuple(ctx, pid, ref_ticks, BADARG_ATOM);
+        return;
     }
 
     TRACE(TAG ": do_publish topic=%s\n", topic_str);
@@ -212,23 +263,40 @@ static term do_publish(Context *ctx, term topic, term data, term qos, term retai
     free(topic_str);
 
     if (msg_id == -1) {
-        ESP_LOGE(TAG, "Error: unable to publish to topic.\n");
-        return ERROR_ATOM;
-    }
+        ESP_LOGE(TAG, "Error: unable to publish to topic.");
 
-    return term_from_int(msg_id);
+        sync_send_error_tuple(ctx, pid, ref_ticks, make_atom(global, publish_failed_atom));
+    } else {
+
+        term ok_tuple = term_alloc_tuple(2, &ctx->heap);
+        term_put_tuple_element(ok_tuple, 0, OK_ATOM);
+        term_put_tuple_element(ok_tuple, 1, term_from_int(msg_id));
+
+        sync_send_reply(ctx, pid, ref_ticks, ok_tuple);
+    }
 }
 
 
-static term do_subscribe(Context *ctx, term topic, term qos)
+static void do_subscribe(Context *ctx, term pid, uint64_t ref_ticks, term topic, term qos)
 {
+    TRACE(TAG ": do_subscribe\n");
+    GlobalContext *global = ctx->global;
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
     esp_mqtt_client_handle_t client = plfdat->client;
+
+    // {ok, MsgId :: integer()} | {error, Reason}
+    if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        sync_send_message(pid, OUT_OF_MEMORY_ATOM, global);
+    }
 
     int ok;
     char *topic_str = interop_term_to_string(topic, &ok);
     if (!ok) {
-        return BADARG_ATOM;
+        ESP_LOGE(TAG, "Error: topic is not a string.");
+        sync_send_error_tuple(ctx, pid, ref_ticks, BADARG_ATOM);
+        return;
     }
 
     TRACE(TAG ": do_subscribe topic=%s\n", topic_str);
@@ -241,22 +309,37 @@ static term do_subscribe(Context *ctx, term topic, term qos)
 
     if (msg_id == -1) {
         ESP_LOGE(TAG, "Error: unable to subscribe to topic.\n");
-        return ERROR_ATOM;
-    }
+        sync_send_error_tuple(ctx, pid, ref_ticks, make_atom(global, subscribe_failed_atom));
+    } else {
+        term ok_tuple = term_alloc_tuple(2, &ctx->heap);
+        term_put_tuple_element(ok_tuple, 0, OK_ATOM);
+        term_put_tuple_element(ok_tuple, 1, term_from_int(msg_id));
 
-    return term_from_int(msg_id);
+        sync_send_reply(ctx, pid, ref_ticks, ok_tuple);
+    }
 }
 
 
-static term do_unsubscribe(Context *ctx, term topic)
+static void do_unsubscribe(Context *ctx, term pid, uint64_t ref_ticks, term topic)
 {
+    TRACE(TAG ": do_unsubscribe\n");
+    GlobalContext *global = ctx->global;
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
     esp_mqtt_client_handle_t client = plfdat->client;
+
+    // {ok, MsgId :: integer()} | {error, Reason}
+    if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
+        ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+        sync_send_message(pid, OUT_OF_MEMORY_ATOM, global);
+    }
 
     int ok;
     char *topic_str = interop_term_to_string(topic, &ok);
     if (!ok) {
-        return BADARG_ATOM;
+        ESP_LOGE(TAG, "Error: topic is not a string.");
+        sync_send_error_tuple(ctx, pid, ref_ticks, BADARG_ATOM);
+        return;
     }
 
     TRACE(TAG ": do_unsubscribe topic=%s\n", topic_str);
@@ -268,19 +351,24 @@ static term do_unsubscribe(Context *ctx, term topic)
 
     if (msg_id == -1) {
         ESP_LOGE(TAG, "Error: unable to unsubscribe from topic.\n");
-        return ERROR_ATOM;
-    }
+        sync_send_error_tuple(ctx, pid, ref_ticks, make_atom(global, unsubscribe_failed_atom));
+    } else {
+        term ok_tuple = term_alloc_tuple(2, &ctx->heap);
+        term_put_tuple_element(ok_tuple, 0, OK_ATOM);
+        term_put_tuple_element(ok_tuple, 1, term_from_int(msg_id));
 
-    return term_from_int(msg_id);
+        sync_send_reply(ctx, pid, ref_ticks, ok_tuple);
+    }
 }
 
 
-static void do_stop(Context *ctx)
+static void do_stop(Context *ctx, term pid, uint64_t ref_ticks)
 {
+    TRACE(TAG ": do_stop\n");
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
     esp_mqtt_client_handle_t client = plfdat->client;
 
-    TRACE(TAG ": do_stop\n");
     esp_mqtt_client_stop(client);
     esp_mqtt_client_destroy(client);
     scheduler_terminate(ctx);
@@ -288,48 +376,72 @@ static void do_stop(Context *ctx)
 }
 
 
-static term do_disconnect(Context *ctx)
+static void do_disconnect(Context *ctx, term pid, uint64_t ref_ticks)
 {
+    TRACE(TAG ": do_disconnect\n");
+    GlobalContext *global = ctx->global;
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
     esp_mqtt_client_handle_t client = plfdat->client;
 
     TRACE(TAG ": do_disconnect\n");
-    esp_err_t status = esp_mqtt_client_disconnect(client);
+    esp_err_t err = esp_mqtt_client_disconnect(client);
 
-    if (status == ESP_OK) {
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error: unable to disconnect from MQTT Broker.\n");
-        return ERROR_ATOM;
-    }
 
-    return OK_ATOM;
+        if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
+            ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+            sync_send_message(pid, OUT_OF_MEMORY_ATOM, global);
+        }
+
+        // TODO map error code to an informative atom
+        sync_send_error_tuple(ctx, pid, ref_ticks, term_from_int(err));
+    } else {
+        sync_send_reply(ctx, pid, ref_ticks, OK_ATOM);
+    }
 }
 
 
-static term do_reconnect(Context *ctx)
+static void do_reconnect(Context *ctx, term pid, uint64_t ref_ticks)
 {
+    TRACE(TAG ": do_reconnect\n");
+    GlobalContext *global = ctx->global;
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
     esp_mqtt_client_handle_t client = plfdat->client;
 
     TRACE(TAG ": do_reconnect\n");
-    esp_err_t status = esp_mqtt_client_reconnect(client);
+    esp_err_t err = esp_mqtt_client_reconnect(client);
 
-    if (status == ESP_OK) {
+    if (err != ESP_OK) {
         ESP_LOGE(TAG, "Error: unable to reconnect to MQTT Broker.\n");
-        return ERROR_ATOM;
-    }
 
-    return OK_ATOM;
+        if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
+            ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.", __FILE__, __LINE__);
+            sync_send_message(pid, OUT_OF_MEMORY_ATOM, global);
+        }
+
+        // TODO map error code to an informative atom
+        sync_send_error_tuple(ctx, pid, ref_ticks, term_from_int(err));
+    } else {
+        sync_send_reply(ctx, pid, ref_ticks, OK_ATOM);
+    }
 }
 
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
+    TRACE(TAG ": mqtt_event_handler\n");
     esp_mqtt_event_handle_t event = event_data;
 
     Context *ctx = (Context *) event->user_context;
+    GlobalContext *global = ctx->global;
+
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
-    int pid = term_to_local_process_id(plfdat->receiver);
-    Context *target = globalcontext_get_process(ctx->global, pid);
+    int receiver = plfdat->receiver;
+
+    Context *target = globalcontext_get_process_lock(global, receiver);
 
     esp_mqtt_event_id_t mqtt_event_id = (esp_mqtt_event_id_t) event_id;
     switch (mqtt_event_id) {
@@ -337,93 +449,78 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         case MQTT_EVENT_CONNECTED: {
             TRACE(TAG ": MQTT_EVENT_CONNECTED\n");
 
-            if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
-            }
-
-            term msg = port_create_tuple2(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
-                make_atom(ctx->global, connected_atom)
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(2), heap);
+            term msg = port_heap_create_tuple2(
+                &heap,
+                make_atom(global, mqtt_atom),
+                make_atom(global, connected_atom)
             );
+            port_send_message_nolock(global, receiver, msg);
+            END_WITH_STACK_HEAP(heap, global);
 
-            mailbox_send(target, msg);
             break;
         }
 
         case MQTT_EVENT_DISCONNECTED: {
             TRACE(TAG ": MQTT_EVENT_DISCONNECTED\n");
 
-            if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(2)) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
-            }
-
-            term msg = port_create_tuple2(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
-                make_atom(ctx->global, disconnected_atom)
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(2), heap);
+            term msg = port_heap_create_tuple2(
+                &heap,
+                make_atom(global, mqtt_atom),
+                make_atom(global, disconnected_atom)
             );
+            port_send_message_nolock(global, receiver, msg);
+            END_WITH_STACK_HEAP(heap, global);
 
-            mailbox_send(target, msg);
             break;
         }
 
         case MQTT_EVENT_SUBSCRIBED: {
             TRACE(TAG ": MQTT_EVENT_SUBSCRIBED, msg_id=%d\n", event_id);
 
-            if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(3)) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
-            }
-
-            term msg = port_create_tuple3(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
-                make_atom(ctx->global, subscribed_atom),
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+            term msg = port_heap_create_tuple3(
+                &heap,
+                make_atom(global, mqtt_atom),
+                make_atom(global, subscribed_atom),
                 term_from_int(event->msg_id)
             );
+            port_send_message_nolock(global, receiver, msg);
+            END_WITH_STACK_HEAP(heap, global);
 
-            mailbox_send(target, msg);
             break;
         }
 
         case MQTT_EVENT_UNSUBSCRIBED: {
             TRACE(TAG ": MQTT_EVENT_UNSUBSCRIBED, msg_id=%d\n", event_id);
 
-            if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(3)) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
-            }
-
-            term msg = port_create_tuple3(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
-                make_atom(ctx->global, unsubscribed_atom),
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+            term msg = port_heap_create_tuple3(
+                &heap,
+                make_atom(global, mqtt_atom),
+                make_atom(global, unsubscribed_atom),
                 term_from_int(event->msg_id)
             );
+            port_send_message_nolock(global, receiver, msg);
+            END_WITH_STACK_HEAP(heap, global);
 
-            mailbox_send(target, msg);
             break;
         }
 
         case MQTT_EVENT_PUBLISHED: {
             TRACE(TAG ": MQTT_EVENT_PUBLISHED, msg_id=%d\n", event->msg_id);
 
-            if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(3)) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
-            }
-
-            term msg = port_create_tuple3(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
-                make_atom(ctx->global, published_atom),
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3), heap);
+            term msg = port_heap_create_tuple3(
+                &heap,
+                make_atom(global, mqtt_atom),
+                make_atom(global, published_atom),
                 term_from_int(event->msg_id)
             );
+            port_send_message_nolock(global, receiver, msg);
+            END_WITH_STACK_HEAP(heap, global);
 
-            mailbox_send(target, msg);
             break;
         }
 
@@ -432,23 +529,31 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             TRACE(TAG ": TOPIC=%.*s\n", event->topic_len, event->topic);
             TRACE(TAG ": DATA=%.*s\n", event->data_len, event->data);
 
-            int topic_size = term_binary_data_size_in_terms(event->topic_len);
-            int data_size = term_binary_data_size_in_terms(event->data_len);
-            if (UNLIKELY(memory_ensure_free(ctx, TUPLE_SIZE(4) + topic_size + data_size) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
+            int topic_size = term_binary_data_size_in_terms(event->topic_len) + BINARY_HEADER_SIZE;
+            int data_size = term_binary_data_size_in_terms(event->data_len) + BINARY_HEADER_SIZE;
+
+            size_t requested_size = TUPLE_SIZE(4) + topic_size + data_size;
+            Heap heap;
+            // {mqtt, data, Topic :: string(), Data :: binary()}
+            if (UNLIKELY(memory_init_heap(&heap, requested_size) != MEMORY_GC_OK)) {
+                ESP_LOGW(TAG, "Failed to allocate memory: %s:%i.\n", __FILE__, __LINE__);
+                // TODO send a message??
+            } else {
+
+                term topic = term_from_literal_binary(event->topic, event->topic_len, &heap, global);
+                term data = term_from_literal_binary(event->data, event->data_len, &heap, global);
+
+                term msg = heap_create_tuple4(
+                    &heap,
+                    make_atom(global, mqtt_atom),
+                    make_atom(global, data_atom),
+                    topic, data
+                );
+                port_send_message_nolock(global, receiver, msg);
+
+                memory_destroy_heap(&heap, global);
             }
 
-            term topic = term_from_literal_binary(event->topic, event->topic_len, ctx);
-            term data = term_from_literal_binary(event->data, event->data_len, ctx);
-            term msg = create_tuple4(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
-                make_atom(ctx->global, data_atom),
-                topic, data
-            );
-
-            mailbox_send(target, msg);
             break;
         }
 
@@ -456,30 +561,26 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGE(TAG, "MQTT_EVENT_ERROR");
 
             // {mqtt, {ErrorType :: atom(), ConnectReturnCode :: atom(), tls_last_esp_err :: integer(), tls_stack_err :: integer(), tls_cert_verify_flags :: integer()}}
-            size_t heap_size = TUPLE_SIZE(3) + TUPLE_SIZE(5);
-            if (UNLIKELY(memory_ensure_free(ctx, heap_size) != MEMORY_GC_OK)) {
-                mailbox_send(target, MEMORY_ATOM);
-                return;
-            }
-
+            BEGIN_WITH_STACK_HEAP(TUPLE_SIZE(3) + TUPLE_SIZE(5), heap);
             esp_mqtt_error_codes_t *mqtt_error = event->error_handle;
-            term error = create_tuple5(
-                ctx,
-                error_type_to_atom(ctx->global, mqtt_error->error_type),
-                connect_return_code_to_atom(ctx->global, mqtt_error->connect_return_code),
+            term error = heap_create_tuple5(
+                &heap,
+                error_type_to_atom(global, mqtt_error->error_type),
+                connect_return_code_to_atom(global, mqtt_error->connect_return_code),
                 term_from_int(mqtt_error->esp_tls_last_esp_err),
                 term_from_int(mqtt_error->esp_tls_stack_err),
                 term_from_int(mqtt_error->esp_tls_cert_verify_flags)
             );
 
-            term msg = port_create_tuple3(
-                ctx,
-                make_atom(ctx->global, mqtt_atom),
+            term msg = port_heap_create_tuple3(
+                &heap,
+                make_atom(global, mqtt_atom),
                 ERROR_ATOM,
                 error
             );
+            port_send_message_nolock(global, receiver, msg);
+            END_WITH_STACK_HEAP(heap, global);
 
-            mailbox_send(target, msg);
             break;
         }
 
@@ -492,22 +593,28 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             ESP_LOGW(TAG, "Other event.  event_id: %d", event_id);
             break;
     }
+
+    globalcontext_get_process_unlock(global, target);
 }
 
 
-static void consume_mailbox(Context *ctx)
+static NativeHandlerResult consume_mailbox(Context *ctx)
 {
-    Message *message = mailbox_dequeue(ctx);
+    TRACE(TAG ": Processing mailbox message for process_id %i\n", ctx->process_id);
+    // GlobalContext *global = ctx->global;
+    Message *message = mailbox_first(&ctx->mailbox);
     term msg = message->message;
+
+#ifdef ENABLE_TRACE
+    TRACE("message: ");
+    term_display(stdout, msg, ctx);
+    TRACE("\n");
+#endif
+
     term pid = term_get_tuple_element(msg, 0);
     term ref = term_get_tuple_element(msg, 1);
+    uint64_t ref_ticks = term_to_ref_ticks(ref);
     term req = term_get_tuple_element(msg, 2);
-
-    int local_process_id = term_to_local_process_id(pid);
-    Context *target = globalcontext_get_process(ctx->global, local_process_id);
-
-    term ret = ERROR_ATOM;
-
 
     if (term_is_atom(req)) {
 
@@ -515,15 +622,15 @@ static void consume_mailbox(Context *ctx)
         switch (cmd) {
 
             case MQTTStopCmd:
-                do_stop(ctx);
+                do_stop(ctx, pid, ref_ticks);
                 break;
 
             case MQTTDisconnectCmd:
-                ret = do_disconnect(ctx);
+                do_disconnect(ctx, pid, ref_ticks);
                 break;
 
             case MQTTReconnectCmd:
-                ret = do_reconnect(ctx);
+                do_reconnect(ctx, pid, ref_ticks);
                 break;
 
             default:
@@ -540,20 +647,20 @@ static void consume_mailbox(Context *ctx)
                     term data = term_get_tuple_element(req, 2);
                     term qos = term_get_tuple_element(req, 3);
                     term retain = term_get_tuple_element(req, 4);
-                    ret = do_publish(ctx, topic, data, qos, retain);
+                    do_publish(ctx, pid, ref_ticks, topic, data, qos, retain);
                 }
                 break;
 
             case MQTTSubscribeCmd: {
                     term topic = term_get_tuple_element(req, 1);
                     term qos = term_get_tuple_element(req, 2);
-                    ret = do_subscribe(ctx, topic, qos);
+                    do_subscribe(ctx, pid, ref_ticks, topic, qos);
                 }
                 break;
 
             case MQTTUnSubscribeCmd: {
                     term topic = term_get_tuple_element(req, 1);
-                    ret = do_unsubscribe(ctx, topic);
+                    do_unsubscribe(ctx, pid, ref_ticks, topic);
                 }
                 break;
 
@@ -565,16 +672,9 @@ static void consume_mailbox(Context *ctx)
         ESP_LOGE(TAG, "Invalid command");
     }
 
-    // {Ref, ok | error}
-    size_t heap_size = TUPLE_SIZE(2) + REF_SIZE;
-    if (UNLIKELY(memory_ensure_free(ctx, heap_size) != MEMORY_GC_OK)) {
-        mailbox_send(target, MEMORY_ATOM);
-    } else {
-        term ret_msg = port_create_tuple2(ctx, ref, ret);
-        mailbox_send(target, ret_msg);
-    }
+    mailbox_remove_message(&ctx->mailbox, &ctx->heap);
 
-    mailbox_destroy_message(message);
+    return NativeContinue;
 }
 
 //
@@ -604,28 +704,28 @@ static char *maybe_get_string(term kv, AtomString key, GlobalContext *global)
 }
 
 // NB. Caller assumes ownership of returned string
-static char *get_string_default(term kv, AtomString key, AtomString default_value, GlobalContext *global)
-{
-    term value_term = interop_kv_get_value(kv, key, global);
-    if (!term_is_string(value_term) && !term_is_binary(value_term)) {
-        int len = atom_string_len(default_value);
-        char *buf = malloc(len + 1);
-        if (IS_NULL_PTR(buf)) {
-            ESP_LOGW(TAG, "Unable to allocate memory for default value");
-            return NULL;
-        }
-        atom_string_to_c(default_value, buf, len);
-        return buf;
-    }
+// static char *get_string_default(term kv, AtomString key, AtomString default_value, GlobalContext *global)
+// {
+//     term value_term = interop_kv_get_value(kv, key, global);
+//     if (!term_is_string(value_term) && !term_is_binary(value_term)) {
+//         int len = atom_string_len(default_value);
+//         char *buf = malloc(len + 1);
+//         if (IS_NULL_PTR(buf)) {
+//             ESP_LOGW(TAG, "Unable to allocate memory for default value");
+//             return NULL;
+//         }
+//         atom_string_to_c(default_value, buf, len);
+//         return buf;
+//     }
 
-    int ok;
-    char *value_str = interop_term_to_string(value_term, &ok);
-    if (UNLIKELY(!ok)) {
-        ESP_LOGE(TAG, "Error: value is not a proper string or binary.");
-        return NULL;
-    }
-    return value_str;
-}
+//     int ok;
+//     char *value_str = interop_term_to_string(value_term, &ok);
+//     if (UNLIKELY(!ok)) {
+//         ESP_LOGE(TAG, "Error: value is not a proper string or binary.");
+//         return NULL;
+//     }
+//     return value_str;
+// }
 
 // static esp_mqtt_transport_t get_transport(term kv, GlobalContext *global)
 // {
@@ -647,8 +747,8 @@ static char *get_string_default(term kv, AtomString key, AtomString default_valu
 
 Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
 {
-    term receiver_term = interop_kv_get_value(opts, receiver_atom, global);
-    if (UNLIKELY(!term_is_pid(receiver_term))) {
+    term receiver = interop_kv_get_value(opts, receiver_atom, global);
+    if (UNLIKELY(!term_is_pid(receiver))) {
         ESP_LOGE(TAG, "Missing receiver pid during port creation");
         return NULL;
     }
@@ -657,7 +757,7 @@ Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
     ctx->native_handler = consume_mailbox;
 
     struct platform_data *plfdat = malloc(sizeof(struct platform_data));
-    plfdat->receiver = receiver_term;
+    plfdat->receiver = receiver;
     ctx->platform_data = plfdat;
 
     char *url_str = maybe_get_string(opts, url_atom, global);
@@ -668,6 +768,7 @@ Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
     if (term_is_integer(port_term)) {
         port = term_from_int(port_term);
     }
+    UNUSED(port);
     char *username_str = maybe_get_string(opts, username_atom, global);
     char *password_str = maybe_get_string(opts, password_atom, global);
     // char *cert_str = maybe_get_string(opts, cert_atom, global);
@@ -709,6 +810,6 @@ Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
 
 #ifdef CONFIG_AVM_MQTT_CLIENT_ENABLE
 
-REGISTER_PORT_DRIVER(atomvm_mqtt_client, atomvm_mqtt_client_init, atomvm_mqtt_client_create_port)
+REGISTER_PORT_DRIVER(atomvm_mqtt_client, atomvm_mqtt_client_init, NULL, atomvm_mqtt_client_create_port)
 
 #endif
