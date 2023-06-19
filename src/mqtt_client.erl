@@ -768,7 +768,12 @@ do_unsubscribe(Port, Topic) ->
 
 %% @private
 do_stop(Port) ->
-    port:do_disconnect(Port),
+    case port:do_disconnect(Port) of
+        ok ->
+            ok;
+        Error ->
+            io:format("Warning: Unable to disconnect from MQTT broker due to error ~p~n", [Error])
+    end,
     Port ! stop.
 
 %% @private

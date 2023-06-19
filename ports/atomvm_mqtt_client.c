@@ -616,6 +616,7 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
     uint64_t ref_ticks = term_to_ref_ticks(ref);
     term req = term_get_tuple_element(msg, 2);
 
+    NativeHandlerResult result = NativeContinue;
     if (term_is_atom(req)) {
 
         int cmd = interop_atom_term_select_int(cmd_table, req, ctx->global);
@@ -623,6 +624,7 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
 
             case MQTTStopCmd:
                 do_stop(ctx, pid, ref_ticks);
+                result = NativeTerminate;
                 break;
 
             case MQTTDisconnectCmd:
@@ -674,7 +676,7 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
 
     mailbox_remove_message(&ctx->mailbox, &ctx->heap);
 
-    return NativeContinue;
+    return result;
 }
 
 //
