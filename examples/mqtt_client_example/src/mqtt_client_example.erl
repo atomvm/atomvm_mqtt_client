@@ -58,7 +58,7 @@ start_network(StaConfig) ->
     case network:wait_for_sta(StaConfig) of
         {ok, {Address, Netmask, Gateway}} ->
             io:format(
-                "Acquired IP address: ~s Netmask: ~s Gateway: ~s~n",
+                "Acquired IP address: ~p Netmask: ~p Gateway: ~p~n",
                 [Address, Netmask, Gateway]
             ),
             ok;
@@ -87,7 +87,7 @@ publish_loop(MQTT, Topic, Seq) ->
         C:E:S ->
             io:format("Error in publish: ~p:~p~p~n", [C, E, S])
     end,
-    timer:sleep(1000),
+    timer:sleep(5000),
     publish_loop(MQTT, Topic, Seq + 1).
 
 handle_published(MQTT, Topic, MsgId) ->
