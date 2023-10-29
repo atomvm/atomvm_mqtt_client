@@ -64,9 +64,9 @@ jobs:
         cmake ..
 
     - name: "Build erlang and Elixir libs"
-      working-directory: AtomVM/build/libs
+      working-directory: AtomVM/build
       run: |
-        make atomvmlib
+        make esp32boot
 
     - name: "Build ${{ matrix.soc }} AtomVM with atomvm_mqtt_client"
       working-directory: ./AtomVM/src/platforms/esp32/
@@ -83,7 +83,7 @@ jobs:
       working-directory: ./AtomVM/src/platforms/esp32/build
       run: |
         ./mkimage.sh
-        for i in atomvm-${{ matrix.soc }}-*.img; do
+        for i in atomvm-${{ matrix.soc }}.img; do
             mv -- "${i}" "${i%.img}-atomvm_mqtt_client.img"
         done
         ls -l *.img
@@ -92,7 +92,7 @@ jobs:
       uses: actions/upload-artifact@v3
       with:
         name: atomvm-${{ matrix.soc }}-atomvm_mqtt_client-image
-        path: ./AtomVM/src/platforms/esp32/build/atomvm-${{ matrix.soc }}-*.img
+        path: ./AtomVM/src/platforms/esp32/build/atomvm-${{ matrix.soc }}-atomvm_mqtt_client.img
         if-no-files-found: error
 
   avm-build:
