@@ -617,10 +617,16 @@ static NativeHandlerResult consume_mailbox(Context *ctx)
     TRACE("\n");
 #endif
 
-    term pid = term_get_tuple_element(msg, 0);
-    term ref = term_get_tuple_element(msg, 1);
+    GenMessage gen_message;
+    if (UNLIKELY(port_parse_gen_message(msg, &gen_message) != GenCallMessage)) {
+        ESP_LOGW(TAG, "Received invalid message.");
+        mailbox_remove_message(&ctx->mailbox, &ctx->heap);
+        return NativeContinue;
+    }
+    term pid = gen_message.pid;
+    term ref = gen_message.ref;
     uint64_t ref_ticks = term_to_ref_ticks(ref);
-    term req = term_get_tuple_element(msg, 2);
+    term req = gen_message.req;
 
     NativeHandlerResult result = NativeContinue;
     if (term_is_atom(req)) {
