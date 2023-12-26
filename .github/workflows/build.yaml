@@ -20,10 +20,13 @@ jobs:
 
     strategy:
       matrix:
-        idf-version: ["4.4.3"]
+        idf-version: ["4.4.3", "5.1.2"]
         otp: ["24"]
         elixir_version: ["1.11"]
-        soc: ["esp32", "esp32c3", "esp32s2", "esp32s3"]
+        soc: ["esp32", "esp32c3", "esp32c6", "esp32s2", "esp32s3"]
+        exclude:
+        - idf-version: "4.4.3"
+          soc: "esp32c6"
 
     env:
       ImageOS: "ubuntu20"
@@ -41,7 +44,7 @@ jobs:
       run: apt update -y
 
     - name: "Install deps"
-      run: DEBIAN_FRONTEND=noninteractive apt install -y git cmake
+      run: DEBIAN_FRONTEND=noninteractive apt install -y git cmake gperf zlib1g-dev libmbedtls-dev
 
     - name: "System info"
       run: |
