@@ -39,6 +39,8 @@
 // #define ENABLE_TRACE
 #include <trace.h>
 
+#include <inttypes.h>
+
 #define TAG "atomvm_mqtt"
 
 // static const char *const cert_atom =                    ATOM_STR("\x4", "cert");
@@ -435,7 +437,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     TRACE(TAG ": mqtt_event_handler\n");
     esp_mqtt_event_handle_t event = event_data;
 
+#if ESP_IDF_VERSION_MAJOR >= 5
+    Context *ctx = (Context *) handler_args;
+#else
     Context *ctx = (Context *) event->user_context;
+#endif
     GlobalContext *global = ctx->global;
 
     struct platform_data *plfdat = (struct platform_data *) ctx->platform_data;
@@ -529,8 +535,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
             TRACE(TAG ": TOPIC=%.*s\n", event->topic_len, event->topic);
             TRACE(TAG ": DATA=%.*s\n", event->data_len, event->data);
 
-            int topic_size = term_binary_data_size_in_terms(event->topic_len) + BINARY_HEADER_SIZE;
-            int data_size = term_binary_data_size_in_terms(event->data_len) + BINARY_HEADER_SIZE;
+            int topic_size = term_binary_heap_size(event->topic_len);
+            int data_size = term_binary_heap_size(event->data_len);
 
             size_t requested_size = TUPLE_SIZE(4) + topic_size + data_size;
             Heap heap;
@@ -585,12 +591,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
         }
 
         case MQTT_EVENT_BEFORE_CONNECT: {
-            ESP_LOGI(TAG, "MQTT_EVENT_BEFORE_CONNECT event_id: %d", event_id);
+            ESP_LOGI(TAG, "MQTT_EVENT_BEFORE_CONNECT event_id: %" PRIu32, event_id);
             break;
         }
 
         default:
-            ESP_LOGW(TAG, "Other event.  event_id: %d", event_id);
+            ESP_LOGW(TAG, "Other event.  event_id: %" PRIu32, event_id);
             break;
     }
 
@@ -778,9 +784,14 @@ Context *atomvm_mqtt_client_create_port(GlobalContext *global, term opts)
     // Note that char * values passed into this struct are copied into the MQTT state
     const char *client_id = get_default_client_id();
     esp_mqtt_client_config_t mqtt_cfg = {
+#if ESP_IDF_VERSION_MAJOR >= 5
+        .broker.address.uri = url_str,
+        .credentials.client_id = client_id
+#else
         .uri = url_str,
         .client_id = client_id,
         .user_context = (void *) ctx
+#endif
     };
     esp_mqtt_client_handle_t client = esp_mqtt_client_init(&mqtt_cfg);
 

@@ -7,7 +7,7 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
-#    http://www.apache.org/licenses/LICENSE-2.0
+# http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -22,13 +22,24 @@ set(ATOMVM_MQTT_CLIENT_COMPONENT_SRCS
     "ports/atomvm_mqtt_client.c"
 )
 
+# WHOLE_ARCHIVE option is supported only with esp-idf 5.x
+# A link option will be used with esp-idf 4.x
+if(IDF_VERSION_MAJOR EQUAL 5)
+    set(OPTIONAL_WHOLE_ARCHIVE WHOLE_ARCHIVE)
+else()
+    set(OPTIONAL_WHOLE_ARCHIVE "")
+endif()
+
 idf_component_register(
     SRCS ${ATOMVM_MQTT_CLIENT_COMPONENT_SRCS}
     INCLUDE_DIRS "ports/include"
     PRIV_REQUIRES "libatomvm" "avm_sys" "mqtt"
+    ${OPTIONAL_WHOLE_ARCHIVE}
 )
 
-idf_build_set_property(
-    LINK_OPTIONS "-Wl,--whole-archive ${CMAKE_CURRENT_BINARY_DIR}/lib${COMPONENT_NAME}.a -Wl,--no-whole-archive"
-    APPEND
-)
+if(IDF_VERSION_MAJOR EQUAL 4)
+    idf_build_set_property(
+        LINK_OPTIONS "-Wl,--whole-archive ${CMAKE_CURRENT_BINARY_DIR}/lib${COMPONENT_NAME}.a -Wl,--no-whole-archive"
+        APPEND
+    )
+endif()
